@@ -1,0 +1,12 @@
+{
+  "decision":"SHADOW_ONLY",
+  "statistical_candidate_passed":true,
+  "minimum_global_mae_skill_vs_nbm":0.01,
+  "xgb_mae_skill_vs_nbm":0.3118059923,
+  "xgb_mae_f":1.8245957028,
+  "ridge_mae_f":1.8777094038,
+  "station_wins_vs_nbm":5,
+  "required_station_wins":4,
+  "reason":"The XGBoost candidate cleared the rolling-backtest comparison gates, but remains shadow-only until forecasts are prospectively logged from one frozen issue-time contract and re-verified.",
+  "release_blocker":"The retrospective predictor is an hour-wise 24-hour-lead composite, not a single frozen daily forecast issuance. Log and score prospective fixed-cutoff forecasts before production promotion."
+}

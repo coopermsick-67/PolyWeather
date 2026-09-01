@@ -1,0 +1,18 @@
+{
+  "decision":"SHADOW_ONLY",
+  "statistical_candidate_passed":false,
+  "minimum_global_mae_skill_vs_nbm":0.01,
+  "xgb_mae_skill_vs_nbm":0.2753687775,
+  "xgb_mae_f":1.9023042419,
+  "blend_mae_skill_vs_nbm":0.2874208993,
+  "blend_mae_f":1.8706649724,
+  "candidate_model":"Station blend residual",
+  "candidate_prediction_column":"blend_prediction_f",
+  "candidate_mae_f":1.8706649724,
+  "candidate_mae_skill_vs_nbm":0.2874208993,
+  "ridge_mae_f":2.0133633382,
+  "station_wins_vs_nbm":1,
+  "required_station_wins":4,
+  "reason":"Retain in shadow mode: at least one rolling-backtest NBM\/Ridge\/station gate was not met.",
+  "release_blocker":"The retrospective predictor is an hour-wise 24-hour-lead composite, not a single frozen daily forecast issuance. Log and score prospective fixed-cutoff forecasts before production promotion."
+}

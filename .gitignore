@@ -1,0 +1,21 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+data/
+reports/*.png
+reports/*.csv
+reports/*.json
+reports/*.html
+tmp/
+!data/.gitkeep
+
+# artifacts/ is committed on purpose: the deployed API loads the trained
+# model and backtest metrics from here at runtime (see server.py).
+
+dashboard/node_modules/
+dashboard/dist/
+dashboard/vite.log
+dashboard/.env
+dashboard/.env.local

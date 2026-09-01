@@ -1,0 +1,118 @@
+"""Immutable prospective forecast logging and later NCEI verification."""
+
+from __future__ import annotations
+
+import json
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Iterable
+
+import pandas as pd
+
+from .data import fetch_live_forecast_features, fetch_ncei_daily_tmax
+from .metrics import forecast_metrics, interval_metrics
+from .model import ResidualForecaster
+from .stations import Station
+
+
+def create_shadow_records(
+    model: ResidualForecaster,
+    stations: Iterable[Station],
+    target_date: date,
+) -> list[dict]:
+    """Create self-contained, timestamped forecast records for later scoring."""
+    issued_at = datetime.now(timezone.utc).isoformat()
+    records: list[dict] = []
+    for station in stations:
+        local_today = pd.Timestamp.now(tz=station.timezone).date()
+        if target_date <= local_today:
+            raise ValueError(
+                f"{station.icao}: prospective logging requires a target date after local today "
+                f"({local_today.isoformat()}); received {target_date.isoformat()}."
+            )
+        features = fetch_live_forecast_features(station, target_date)
+        output = model.predict(pd.DataFrame([features])).iloc[0].to_dict()
+        records.append(
+            {
+                "station": station.icao,
+                "ghcn_id": station.ghcn_id,
+                "target_date": target_date.isoformat(),
+                "target_definition": "NCEI daily-summaries TMAX (official daily maximum)",
+                "issue_time_utc": issued_at,
+                "issue_time_contract": "latest live multi-model forecast at request time",
+                "source_models": ["NCEP NBM CONUS", "NCEP HRRR CONUS", "NCEP GFS Seamless"],
+                "model_family": f"{model.kind.title()} residual MOS",
+                "nbm_baseline_f": float(features["nbm_baseline_f"]),
+                "forecast_f": float(output["prediction_f"]),
+                "p10_f": float(output["p10_f"]),
+                "p50_f": float(output["p50_f"]),
+                "p90_f": float(output["p90_f"]),
+                "calibration_offset_f": float(output["calibration_offset_f"]),
+                "conformal_halfwidth_f": float(output["conformal_halfwidth_f"]),
+                # The full predictor snapshot prevents a later upstream API
+                # update from silently rewriting what was known at issue time.
+                "feature_snapshot": {
+                    key: value
+                    for key, value in features.items()
+                    if isinstance(value, (str, int, float, bool)) or value is None
+                },
+            }
+        )
+    return records
+
+
+def append_jsonl(records: Iterable[dict], path: str | Path) -> Path:
+    """Append one auditable forecast per station/date/issue contract.
+
+    A duplicate could silently turn a prospective record into cherry-picked
+    reissues, so the operation rejects it rather than choosing a winner.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    materialized = list(records)
+    existing_keys: set[tuple[str, str, str]] = set()
+    if target.exists():
+        for line in target.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                record = json.loads(line)
+                existing_keys.add(
+                    (str(record["station"]), str(record["target_date"]), str(record["issue_time_contract"]))
+                )
+    new_keys: set[tuple[str, str, str]] = set()
+    for record in materialized:
+        key = (str(record["station"]), str(record["target_date"]), str(record["issue_time_contract"]))
+        if key in existing_keys or key in new_keys:
+            raise ValueError(
+                "Refusing duplicate prospective snapshot for "
+                f"station={key[0]}, target_date={key[1]}, contract={key[2]!r}."
+            )
+        new_keys.add(key)
+    with target.open("a", encoding="utf-8") as handle:
+        for record in materialized:
+            handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
+    return target
+
+
+def verify_shadow_log(path: str | Path) -> tuple[pd.DataFrame, dict[str, float]]:
+    """Join mature forecast snapshots to NCEI truth and compute audit metrics."""
+    source = Path(path)
+    if not source.exists():
+        raise FileNotFoundError(f"Shadow log not found: {source}")
+    records = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+    if not records:
+        raise ValueError("Shadow log contains no forecast records.")
+    forecasts = pd.DataFrame(records)
+    forecasts["target_date"] = pd.to_datetime(forecasts["target_date"]).dt.date
+    mature = forecasts.loc[forecasts["target_date"] < date.today()].copy()
+    if mature.empty:
+        return mature, {"n": 0}
+    # The caller's records include official IDs, so reconstruct lightweight
+    # station objects only through package registry at the module boundary.
+    from .stations import STATIONS
+
+    requested = [STATIONS[station] for station in sorted(mature["station"].unique())]
+    labels = fetch_ncei_daily_tmax(requested, mature["target_date"].min(), mature["target_date"].max())
+    verified = mature.merge(labels[["station", "target_date", "tmax_f"]], on=["station", "target_date"], how="inner")
+    metrics = forecast_metrics(verified, "tmax_f", "forecast_f")
+    metrics.update(interval_metrics(verified, actual="tmax_f", lower="p10_f", upper="p90_f"))
+    return verified, metrics

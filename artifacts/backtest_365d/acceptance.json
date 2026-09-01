@@ -1,0 +1,10 @@
+{
+  "decision":"PROMOTE",
+  "minimum_global_mae_skill_vs_nbm":0.01,
+  "xgb_mae_skill_vs_nbm":0.3098803881,
+  "xgb_mae_f":1.8251541632,
+  "ridge_mae_f":1.8922839701,
+  "station_wins_vs_nbm":5,
+  "required_station_wins":4,
+  "reason":"XGBoost cleared all predeclared rolling-backtest gates."
+}

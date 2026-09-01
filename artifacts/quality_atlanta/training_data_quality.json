@@ -1,0 +1,52 @@
+{
+  "rows": 672,
+  "columns": 150,
+  "grain": "one station x local target date x fixed 24-hour archived forecast lead",
+  "date_min": "2024-10-08",
+  "date_max": "2026-08-10",
+  "duplicate_station_date_rows": 0,
+  "missing_required": {
+    "station": 0,
+    "target_date": 0,
+    "tmax_f": 0,
+    "nbm_baseline_f": 0
+  },
+  "tmax_range_f": [
+    30.0,
+    100.0
+  ],
+  "nbm_baseline_range_f": [
+    32.1,
+    96.0
+  ],
+  "implausible_tmax_rows": 0,
+  "implausible_nbm_rows": 0,
+  "nbm_profile_availability_below_90pct_rows": 1,
+  "station_coverage": [
+    {
+      "station": "KATL",
+      "rows": 672,
+      "first_date": "2024-10-08",
+      "last_date": "2026-08-10",
+      "missing_tmax": 0,
+      "missing_nbm": 0
+    }
+  ],
+  "top_feature_missing_rates_pct": {
+    "ncep_nbm_conus__surface_pressure_max": 100.0,
+    "ncep_nbm_conus__surface_pressure_mean": 100.0,
+    "ncep_nbm_conus__shortwave_radiation_min": 100.0,
+    "ncep_nbm_conus__surface_pressure_min": 100.0,
+    "ncep_nbm_conus__shortwave_radiation_max": 100.0,
+    "ncep_nbm_conus__shortwave_radiation_mean": 100.0,
+    "ncep_nbm_conus__dew_point_2m_mean": 1.79,
+    "ncep_nbm_conus__dew_point_2m_max": 1.79,
+    "ncep_nbm_conus__dew_point_2m_min": 1.79,
+    "ncep_nbm_conus__cloud_cover_max": 1.34,
+    "ncep_nbm_conus__cloud_cover_mean": 1.34,
+    "ncep_nbm_conus__cloud_cover_min": 1.34,
+    "ncep_nbm_conus__wind_speed_10m_min": 0.89,
+    "ncep_nbm_conus__wind_speed_10m_mean": 0.89,
+    "ncep_nbm_conus__wind_speed_10m_max": 0.89
+  }
+}

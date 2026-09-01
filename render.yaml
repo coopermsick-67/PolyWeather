@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: polyweather-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -e ".[server]"
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --timeout 60
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.10

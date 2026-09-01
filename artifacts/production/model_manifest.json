@@ -1,0 +1,27 @@
+{
+  "model_path": "artifacts\\production\\xgb_residual_tmax.joblib",
+  "model_family": "XGB residual MOS",
+  "target": "NCEI daily-summaries TMAX (\u00b0F)",
+  "base_forecast": "NCEP NBM hourly profile maximum (\u00b0F)",
+  "feature_schema_version": "v001_archived_nbm_hrrr_gfs",
+  "training_rows": 3060,
+  "training_start": "2024-10-08",
+  "model_fit_end": "2026-06-11",
+  "training_data_end": "2026-08-10",
+  "stations": [
+    "KLAX",
+    "KMDW",
+    "KMIA",
+    "KNYC",
+    "KSFO"
+  ],
+  "conformal_nominal_coverage": 0.75,
+  "conformal_halfwidth_f": 2.4265986323356614,
+  "station_model_selection": null,
+  "calibration_rows": 299,
+  "calibration_start": "2026-06-12",
+  "calibration_end": "2026-08-10",
+  "issue_time_contract": "fixed 24h archived lead composite in backtest; current latest forecast at inference",
+  "release_status": "SHADOW_ONLY until prospective fixed-cutoff logging and verification pass",
+  "created_at_utc": "2026-08-22T22:09:40.079504+00:00"
+}
