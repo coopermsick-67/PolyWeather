@@ -20,3 +20,12 @@ def test_important_city_mappings_use_the_settlement_airport_not_a_nearby_airport
 def test_unknown_station_is_actionable():
     with pytest.raises(ValueError, match="KNYC"):
         require_station("KXYZ")
+
+
+def test_every_registered_station_has_known_market_types():
+    # dashboard_payload.py derives quality_gate's rules_available from
+    # bool(station.market_types); every registered station must have at
+    # least one configured market type or its data-quality badge would
+    # incorrectly report UNKNOWN_SETTLEMENT_RULE.
+    for station in STATIONS.values():
+        assert station.market_types, f"{station.icao} has no configured market types"

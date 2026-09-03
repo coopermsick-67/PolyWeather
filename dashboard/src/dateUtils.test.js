@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { addDays, dateChoice, formatIso, isoToday, longDate, shortDate } from './dateUtils.js'
+import { addDays, dateChoice, formatIso, isoToday, longDate, shortDate, stationDayBounds, stationIsoDate, stationTime } from './dateUtils.js'
 
 test('formatIso pads month and day', () => {
   assert.equal(formatIso(new Date(2026, 0, 5)), '2026-01-05')
@@ -39,4 +39,11 @@ test('dateChoice falls back to a weekday/day label further out', () => {
 test('longDate and shortDate produce non-empty human labels', () => {
   assert.ok(longDate('2026-06-15').length > 0)
   assert.ok(shortDate('2026-06-15').length > 0)
+})
+
+test('station helpers respect the station timezone and DST calendar day', () => {
+  assert.equal(stationIsoDate('2026-09-03T03:30:00Z', 'America/Los_Angeles'), '2026-09-02')
+  assert.equal(stationTime('2026-09-03T03:30:00Z', 'America/Los_Angeles'), '8:30 PM')
+  const bounds = stationDayBounds('2026-03-08', 'America/New_York')
+  assert.equal(bounds.end - bounds.start, 23 * 60 * 60 * 1000)
 })

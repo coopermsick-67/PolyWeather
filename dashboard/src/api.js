@@ -50,3 +50,31 @@ export async function getDashboard(date, { signal, force = false } = {}) {
     return requestDashboard(date, force, signal)
   }
 }
+
+async function postJson(path, body) {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body ?? {}),
+    cache: 'no-store',
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok) {
+    const error = new Error(payload?.error || `Account service returned ${response.status}.`)
+    error.status = response.status
+    throw error
+  }
+  return payload
+}
+
+export function claimDailyPick(stationId, targetDate) {
+  return postJson('/api/access/claim', { stationId, targetDate })
+}
+
+export function startCheckout() {
+  return postJson('/api/billing/checkout')
+}
+
+export function openBillingPortal() {
+  return postJson('/api/billing/portal')
+}

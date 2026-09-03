@@ -14,8 +14,8 @@ import pyarrow.parquet as pq
 
 
 ROOT = Path(__file__).resolve().parents[2]
-INPUT = ROOT / "artifacts" / "backtest_v2" / "rolling_predictions.parquet"
-ACCEPTANCE = ROOT / "artifacts" / "backtest_v2" / "acceptance.json"
+INPUT = ROOT / "artifacts" / "backtest_20_enhanced" / "rolling_predictions.parquet"
+ACCEPTANCE = ROOT / "artifacts" / "backtest_20_enhanced" / "acceptance.json"
 OUTPUT = ROOT / "dashboard" / "public" / "backtest-data.json"
 
 FIELDS = {
@@ -52,13 +52,13 @@ def main() -> None:
     acceptance = json.loads(ACCEPTANCE.read_text(encoding="utf-8"))
     archive_fingerprint = hashlib.sha256(json.dumps(records, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()[:12]
     payload = {
-        "version": "backtest_v2",
+        "version": "backtest_v3_20station",
         "fingerprint": archive_fingerprint,
         "status": "SHADOW_ONLY",
         "target": "Official NOAA/NCEI local-day TMAX",
         "contract": "One archived 24-hour lead per valid hour, aggregated to each station's local-day high.",
         "limitation": acceptance["release_blocker"],
-        "liveParity": "This frozen v2 cohort does not prove live-model accuracy. It is a retrospective, fixed-history evaluation and is not an on-demand replay.",
+        "liveParity": "This frozen 20-station cohort does not prove live-model accuracy. It is a retrospective, fixed-history evaluation and is not an on-demand replay.",
         "sources": ["Archived Open-Meteo NBM", "Archived Open-Meteo HRRR", "Archived Open-Meteo GFS", "Official NOAA/NCEI TMAX outcome"],
         "decision": acceptance["decision"],
         "dateRange": {"start": min(row["date"] for row in records), "end": max(row["date"] for row in records)},

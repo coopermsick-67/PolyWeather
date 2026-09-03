@@ -25,6 +25,20 @@ def test_quality_gate_refuses_stale_conflicting_or_wide_predictions():
     assert quality_gate(station_known=True, rules_available=True, freshness=.9, agreement=.9, interval_width_f=10) == QualityStatus.NO_BET
 
 
+def test_quality_gate_reports_provisional_for_a_fresh_agreeing_forecast():
+    # A fresh, agreeing, tightly-bounded forecast at a known station with
+    # known settlement rules must be able to reach PROVISIONAL. If
+    # rules_available is ever hardcoded False at a call site again, every
+    # forecast would be stuck at UNKNOWN_SETTLEMENT_RULE regardless of these
+    # inputs -- this test fails loudly if that regression is reintroduced.
+    assert quality_gate(station_known=True, rules_available=True, freshness=1.0, agreement=1.0, interval_width_f=4) == QualityStatus.PROVISIONAL
+
+
+def test_quality_gate_flags_unknown_settlement_rule_only_when_actually_unknown():
+    assert quality_gate(station_known=True, rules_available=False, freshness=1.0, agreement=1.0, interval_width_f=4) == QualityStatus.UNKNOWN_SETTLEMENT_RULE
+    assert quality_gate(station_known=False, rules_available=True, freshness=1.0, agreement=1.0, interval_width_f=4) == QualityStatus.UNKNOWN_SETTLEMENT_RULE
+
+
 def test_bracket_probabilities_are_bounded_and_centered():
     values = normal_bracket_probabilities(80, 2, [(78, 79), (80, 81)])
     assert all(0 <= value <= 1 for value in values.values())
