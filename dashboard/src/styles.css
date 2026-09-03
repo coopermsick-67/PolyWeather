@@ -137,6 +137,7 @@ html[data-theme="dark"] .market-card { border-color:#2b3a50; background:#121e31;
 .location-picker-list button { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 40px; border: 0; border-radius: 7px; background: transparent; color: #1b2740; padding: 6px 9px; font: inherit; text-align: left; transition: background .14s ease; }
 .location-picker-list button:hover { background: #f2f6ff; }
 .location-picker-list button.selected { background: #eaf1ff; }
+.location-picker-list button.is-active { outline: 2px solid #075be5; outline-offset: -2px; }
 .location-picker-name { display: grid; flex: 1; min-width: 0; gap: 1px; font-size: 12.5px; font-weight: 700; overflow: hidden; }
 .location-picker-name small { color: #6a7689; font-size: 10.5px; font-weight: 560; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .location-picker-code { flex: none; color: #5e6c82; font-size: 10.5px; font-weight: 780; letter-spacing: .03em; }
@@ -152,6 +153,7 @@ html[data-theme="dark"] .location-picker-search input { color: #edf4ff; }
 html[data-theme="dark"] .location-picker-list button { color: #dbe8ff; }
 html[data-theme="dark"] .location-picker-list button:hover { background: #1a2b45; }
 html[data-theme="dark"] .location-picker-list button.selected { background: #1d3150; }
+html[data-theme="dark"] .location-picker-list button.is-active { outline-color: #4a9dff; }
 html[data-theme="dark"] .location-picker-name small { color: #9eadc2; }
 html[data-theme="dark"] .location-picker-code { color: #9eadc2; }
 html[data-theme="dark"] .location-picker-dot { background: #3a4b66; }

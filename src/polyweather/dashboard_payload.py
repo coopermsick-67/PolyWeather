@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
+import logging
+import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from zoneinfo import ZoneInfo
 
 import joblib
@@ -49,6 +53,32 @@ def validate_dashboard_date(target_date: date) -> None:
         raise ValueError(
             f"Choose a date from {today.isoformat()} through {(today + timedelta(days=7)).isoformat()}."
         )
+
+
+@contextlib.contextmanager
+def _state_file_lock(path: Path, timeout_s: float = 5.0) -> Iterator[None]:
+    """A simple cross-platform exclusive lock so concurrent workers do not
+    interleave read-modify-write cycles on the shared stability-state file."""
+    lock_path = path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + timeout_s
+    fd = None
+    while fd is None:
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                # Proceed without the lock rather than blocking a request
+                # forever on a stale lock file.
+                break
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        if fd is not None:
+            os.close(fd)
+            with contextlib.suppress(OSError):
+                lock_path.unlink()
 
 
 def _load_stability_state(path: Path = STABILITY_STATE_PATH) -> dict[str, Any]:
@@ -170,16 +200,27 @@ def _fetch_live_inputs(station: Any, target_date: date) -> tuple[Any, dict[str, 
 
 
 def _model_stations(model_path: Path) -> list[Any]:
-    """Use the artifact's trained station set, not every configured station."""
+    """Use the artifact's trained station set, not every configured station.
+
+    A missing or malformed manifest means we cannot verify which stations the
+    loaded model was actually trained on, so it is safer to treat *no*
+    station as calibrated than to silently apply an unvalidated correction
+    to every configured station.
+    """
+    manifest_path = model_path.with_name("model_manifest.json")
     try:
-        manifest = json.loads(model_path.with_name("model_manifest.json").read_text(encoding="utf-8"))
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         codes = [str(code).upper() for code in manifest["stations"]]
         selected = [STATIONS[code] for code in codes if code in STATIONS]
         if selected:
             return selected
-    except (OSError, ValueError, KeyError, TypeError):
-        pass
-    return list(STATIONS.values())
+        raise ValueError("model_manifest.json listed no recognized stations")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        logging.getLogger(__name__).error(
+            "Could not read trained-station list from %s (%s); disabling model calibration for this request.",
+            manifest_path, exc,
+        )
+        return []
 
 
 def payload(target_date: date) -> dict:
@@ -193,16 +234,35 @@ def payload(target_date: date) -> dict:
     # receive a live numerical baseline and a NO BET status rather than being
     # hidden or assigned an unvalidated residual-model correction.
     display_stations = list(STATIONS.values())
-    stability_state = _load_stability_state()
-    _prune_stability_state(stability_state, dashboard_today())
-    saved_forecasts: dict[str, Any] = stability_state["forecasts"]
-    forecasts = []
     # Network retrieval dominates response time. Each station uses a separate
     # endpoint request, so running these in parallel removes the avoidable
-    # five-station waterfall without changing the forecast contract.
+    # five-station waterfall without changing the forecast contract. This is
+    # done outside the state-file lock so concurrent requests don't serialize
+    # on network I/O, only on the brief local read-modify-write below.
     with ThreadPoolExecutor(max_workers=min(8, len(display_stations))) as executor:
         futures = [executor.submit(_fetch_live_inputs, station, target_date) for station in display_stations]
         live_inputs = [future.result() for future in futures]
+    with _state_file_lock(STABILITY_STATE_PATH):
+        stability_state = _load_stability_state()
+        _prune_stability_state(stability_state, dashboard_today())
+        saved_forecasts: dict[str, Any] = stability_state["forecasts"]
+        forecasts, stability_state = _build_forecasts(
+            live_inputs, model, trained_station_ids, model_version, target_date, saved_forecasts, stability_state
+        )
+        _write_stability_state(stability_state)
+    return _assemble_payload(target_date, forecasts, model_version)
+
+
+def _build_forecasts(
+    live_inputs: list[tuple[Any, dict[str, Any], dict[str, Any] | None]],
+    model: Any,
+    trained_station_ids: set[str],
+    model_version: str,
+    target_date: date,
+    saved_forecasts: dict[str, Any],
+    stability_state: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    forecasts: list[dict[str, Any]] = []
     for station, features, observation in live_inputs:
         icao = station.icao
         baseline_high = float(features.get("nbm_baseline_f", np.nan))
@@ -210,7 +270,10 @@ def payload(target_date: date) -> dict:
         prediction = model.predict(pd.DataFrame([features])).iloc[0] if is_calibrated else None
         predicted_high = float(prediction["prediction_f"]) if prediction is not None else baseline_high
         if not np.isfinite(predicted_high) or not np.isfinite(baseline_high):
-            raise ValueError(f"Forecast inputs are incomplete for {icao}; no estimate was displayed.")
+            # Skip only this station rather than failing the whole dashboard
+            # payload; the other stations' forecasts remain independently valid.
+            logging.getLogger(__name__).error("Forecast inputs are incomplete for %s; omitting from this response.", icao)
+            continue
         raw_model_high_rounded = int(np.rint(predicted_high))
         baseline_high_rounded = int(np.rint(baseline_high))
         observed_high = observation.get("observedDailyHighF") if observation else None
@@ -285,7 +348,10 @@ def payload(target_date: date) -> dict:
         )
     stability_state["forecasts"] = saved_forecasts
     stability_state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
-    _write_stability_state(stability_state)
+    return forecasts, stability_state
+
+
+def _assemble_payload(target_date: date, forecasts: list[dict[str, Any]], model_version: str) -> dict:
     return {
         "targetDate": target_date.isoformat(),
         "today": dashboard_today().isoformat(),

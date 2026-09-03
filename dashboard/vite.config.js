@@ -3,6 +3,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import react from '@vitejs/plugin-react'
+import { sites } from '@openai/sites-vite-plugin'
 import { defineConfig } from 'vite'
 
 const execFileAsync = promisify(execFile)
@@ -30,9 +31,10 @@ function forecastApi() {
           res.setHeader('Content-Type', 'application/json')
           res.end(stdout)
         } catch (error) {
+          console.error('[polyweather-forecast-api]', error.stderr || error.message || error)
           res.statusCode = 500
           res.setHeader('Content-Type', 'application/json')
-          res.end(JSON.stringify({ error: error.stderr || error.message || 'Forecast service unavailable.' }))
+          res.end(JSON.stringify({ error: 'Forecast service unavailable. Check the dev server logs.' }))
         }
       })
     },
@@ -40,6 +42,6 @@ function forecastApi() {
 }
 
 export default defineConfig({
-  plugins: [react(), forecastApi()],
+  plugins: [react(), forecastApi(), sites()],
   server: { host: '127.0.0.1', port: 5173 },
 })

@@ -6,7 +6,8 @@ export async function getDashboard(date, { signal } = {}) {
   const abortFromCaller = () => controller.abort()
   signal?.addEventListener('abort', abortFromCaller, { once: true })
   try {
-    const response = await fetch(`${API_BASE_URL}/api/dashboard?date=${encodeURIComponent(date)}`, { signal: controller.signal })
+    const url = `${API_BASE_URL}/api/dashboard?date=${encodeURIComponent(date)}`
+    const response = await fetch(url, { signal: controller.signal })
     const contentType = response.headers.get('content-type') || ''
     const payload = contentType.includes('application/json') ? await response.json() : null
     if (!response.ok) throw new Error(payload?.error || `Forecast service returned ${response.status}.`)

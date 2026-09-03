@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from threading import Lock
@@ -14,6 +15,7 @@ from .stations import Station
 
 
 NWS_BASE_URL = "https://api.weather.gov"
+MAX_CACHE_ENTRIES = 256
 
 
 @dataclass(frozen=True)
@@ -32,7 +34,7 @@ class NWSClient:
         self.user_agent = user_agent
         self.timeout_s = timeout_s
         self.cache_ttl_s = cache_ttl_s
-        self._cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._cache: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
         self._lock = Lock()
 
     def get(self, path: str, params: dict[str, object] | None = None) -> SourceSnapshot:
@@ -42,6 +44,8 @@ class NWSClient:
         with self._lock:
             cached = self._cache.get(key)
         if cached and now - cached[0] < self.cache_ttl_s:
+            with self._lock:
+                self._cache.move_to_end(key)
             return self._snapshot(url, cached[1], stale=False)
         error: Exception | None = None
         for attempt in range(3):
@@ -53,6 +57,9 @@ class NWSClient:
                     raise ValueError("NWS returned a non-object JSON response")
                 with self._lock:
                     self._cache[key] = (time.monotonic(), payload)
+                    self._cache.move_to_end(key)
+                    while len(self._cache) > MAX_CACHE_ENTRIES:
+                        self._cache.popitem(last=False)
                 return self._snapshot(url, payload, stale=False)
             except (requests.RequestException, ValueError) as exc:
                 error = exc

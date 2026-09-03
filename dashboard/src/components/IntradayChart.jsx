@@ -18,8 +18,10 @@ function formatClock(ms) {
 export default function IntradayChart({ forecast }) {
   const [hoverX, setHoverX] = useState(null)
   const scrollRef = useRef(null)
+  const rafRef = useRef(null)
 
   useEffect(() => { setHoverX(null) }, [forecast?.station])
+  useEffect(() => () => { if (rafRef.current) cancelAnimationFrame(rafRef.current) }, [])
 
   useEffect(() => {
     const container = scrollRef.current
@@ -62,8 +64,12 @@ export default function IntradayChart({ forecast }) {
   const hoverPoint = hoverTime == null ? null : nearestPoint(allPoints, hoverTime)
   const onPointerMove = (event) => {
     const rect = event.currentTarget.getBoundingClientRect()
-    const svgX = ((event.clientX - rect.left) / rect.width) * SVG_WIDTH
-    setHoverX(Math.max(0, Math.min(CHART_WIDTH, svgX - CHART_LEFT)))
+    const clientX = event.clientX
+    if (rafRef.current) cancelAnimationFrame(rafRef.current)
+    rafRef.current = requestAnimationFrame(() => {
+      const svgX = ((clientX - rect.left) / rect.width) * SVG_WIDTH
+      setHoverX(Math.max(0, Math.min(CHART_WIDTH, svgX - CHART_LEFT)))
+    })
   }
   const freshnessLabel = forecast.dataFreshness >= 1 ? 'Fresh' : 'Stale'
   return <section className="intraday-card" aria-labelledby="intraday-title">

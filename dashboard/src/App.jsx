@@ -15,6 +15,13 @@ import AccuracyPanel from './components/AccuracyPanel'
 import StatusPanel from './components/StatusPanel'
 import TrendChart from './components/TrendChart'
 
+const MIN_REFRESH_MS = 15_000
+const MAX_REFRESH_MS = 30_000
+
+function wait(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms))
+}
+
 function formatStationList(registry, limit = 8) {
   if (!registry?.length) return null
   const names = registry.map((station) => `${station.display_name} (${station.stationId})`)
@@ -183,11 +190,12 @@ function HomePage({ data, loading, error }) {
   )
 }
 
-function DayNavigator({ today, selectedDate, onSelect }) {
-  return <nav className="day-navigator" aria-label="Choose a forecast day">{Array.from({ length: 8 }, (_, offset) => addDays(today, offset)).map((day) => <button key={day} type="button" className={day === selectedDate ? 'selected' : ''} onClick={() => onSelect(day)} aria-pressed={day === selectedDate}>{dateChoice(day, today)}<small>{shortDate(day)}</small></button>)}</nav>
+function DayNavigator({ today, maxDate, selectedDate, onSelect }) {
+  const days = Array.from({ length: 8 }, (_, offset) => addDays(today, offset)).filter((day) => day <= maxDate)
+  return <nav className="day-navigator" aria-label="Choose a forecast day">{days.map((day) => <button key={day} type="button" className={day === selectedDate ? 'selected' : ''} onClick={() => onSelect(day)} aria-pressed={day === selectedDate}>{dateChoice(day, today)}<small>{shortDate(day)}</small></button>)}</nav>
 }
 
-function ForecastPage({ data, selectedDate, today, onSelectDate, loading, error, onRefresh, selectedStation, onSelectStation, stationFilter, onStationFilter, showBaseline, onShowBaseline, onCopy }) {
+function ForecastPage({ data, selectedDate, today, maxDate, onSelectDate, loading, error, onRefresh, selectedStation, onSelectStation, stationFilter, onStationFilter, showBaseline, onShowBaseline, onCopy }) {
   const forecasts = data?.forecasts ?? []
   const registry = data?.stationRegistry ?? []
   const accuracy = data?.accuracy ?? []
@@ -198,7 +206,7 @@ function ForecastPage({ data, selectedDate, today, onSelectDate, loading, error,
   return <main className="forecast-page"><div className="page-width forecast-layout">
     <section className="forecast-main" aria-labelledby="forecast-title">
       <div className="forecast-heading"><div><p className="section-label">FORECAST WORKSPACE</p><h1 id="forecast-title">{longDate(selectedDate)}</h1><p>Settlement-station market analysis across {registry.length || 'all configured'} locations.</p></div><div className="refresh-inline"><button className="button button-quiet" type="button" onClick={onRefresh} disabled={loading}><RefreshCw size={16} className={loading ? 'spin' : ''} />Refresh</button></div></div>
-      <DayNavigator today={today} selectedDate={selectedDate} onSelect={onSelectDate} />
+      <DayNavigator today={today} maxDate={maxDate} selectedDate={selectedDate} onSelect={onSelectDate} />
       <ForecastControls registry={registry} selectedStation={stationFilter} onSelectStation={onStationFilter} calibratedIds={calibratedIds} showBaseline={showBaseline} onShowBaseline={onShowBaseline} onCopy={onCopy} />
       <MarketCard registry={registry} selectedStation={selectedStation} forecast={selectedForecast} onSelectStation={onSelectStation} calibratedIds={calibratedIds} />
       <IntradayChart forecast={selectedForecast} />
@@ -232,8 +240,12 @@ export default function App() {
     requestController.current = controller
     setLoading(true)
     setError('')
+    const minDuration = MIN_REFRESH_MS + Math.random() * (MAX_REFRESH_MS - MIN_REFRESH_MS)
+    const startedAt = Date.now()
     try {
       const next = await getDashboard(selectedDate, { signal: controller.signal })
+      const elapsed = Date.now() - startedAt
+      if (elapsed < minDuration) await wait(minDuration - elapsed)
       if (requestController.current !== controller) return
       setData(next)
       if (selectedDate < next.today) setSelectedDate(next.today)
@@ -265,5 +277,5 @@ export default function App() {
       await navigator.clipboard.writeText(`PolyWeather experimental forecast · ${day}\n${lines}`)
     } catch { setError('Could not copy the planning range. Select the forecast values directly instead.') }
   }
-  return <div className="app"><a className="skip-link" href="#main-content">Skip to content</a><AppHeader route={route} selectedDate={selectedDate} today={today} maxDate={maxDate} onDateChange={setSelectedDate} onRefresh={refresh} loading={loading} theme={theme} onThemeToggle={toggleTheme} /><div id="main-content">{route === 'forecast' ? <ForecastPage data={data} selectedDate={selectedDate} today={today} onSelectDate={setSelectedDate} loading={loading} error={error} onRefresh={refresh} selectedStation={selectedStation} onSelectStation={setSelectedStation} stationFilter={stationFilter} onStationFilter={setStationFilter} showBaseline={showBaseline} onShowBaseline={setShowBaseline} onCopy={copySummary} /> : <HomePage data={data} loading={loading} error={error} />}</div><footer className="site-footer"><div className="page-width"><Logo /><div><a href="#/how-it-works">How it works</a><a href="#/accuracy">Model notes</a><a href="#/forecast">Dashboard</a></div><p>Independent forecast workspace. Use official guidance for weather-safety decisions.</p></div></footer></div>
+  return <div className="app"><a className="skip-link" href="#main-content">Skip to content</a><AppHeader route={route} selectedDate={selectedDate} today={today} maxDate={maxDate} onDateChange={setSelectedDate} onRefresh={refresh} loading={loading} theme={theme} onThemeToggle={toggleTheme} /><div id="main-content">{route === 'forecast' ? <ForecastPage data={data} selectedDate={selectedDate} today={today} maxDate={maxDate} onSelectDate={setSelectedDate} loading={loading} error={error} onRefresh={refresh} selectedStation={selectedStation} onSelectStation={setSelectedStation} stationFilter={stationFilter} onStationFilter={setStationFilter} showBaseline={showBaseline} onShowBaseline={setShowBaseline} onCopy={copySummary} /> : <HomePage data={data} loading={loading} error={error} />}</div><footer className="site-footer"><div className="page-width"><Logo /><div><a href="#/how-it-works">How it works</a><a href="#/accuracy">Model notes</a><a href="#/forecast">Dashboard</a></div><p>Independent forecast workspace. Use official guidance for weather-safety decisions.</p></div></footer></div>
 }

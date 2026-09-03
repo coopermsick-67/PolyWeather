@@ -167,9 +167,16 @@ def parse_manual_market(record: dict[str, object]) -> MarketSpec:
     )
 
 
+MAX_IMPORT_FILE_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_IMPORT_RECORDS = 20_000
+
+
 def import_markets(path: str | Path) -> tuple[list[MarketSpec], list[dict[str, str]]]:
     """Import JSON/CSV market records, retaining rejected rows for review."""
     source = Path(path)
+    file_size = source.stat().st_size
+    if file_size > MAX_IMPORT_FILE_BYTES:
+        raise ValueError(f"Market import file is {file_size} bytes, exceeding the {MAX_IMPORT_FILE_BYTES}-byte limit.")
     if source.suffix.casefold() == ".json":
         records = json.loads(source.read_text(encoding="utf-8"))
     elif source.suffix.casefold() == ".csv":
@@ -179,6 +186,8 @@ def import_markets(path: str | Path) -> tuple[list[MarketSpec], list[dict[str, s
         raise ValueError("Only JSON and CSV market imports are supported.")
     if not isinstance(records, list):
         raise ValueError("Market import must contain a list of records.")
+    if len(records) > MAX_IMPORT_RECORDS:
+        raise ValueError(f"Market import contains {len(records)} records, exceeding the {MAX_IMPORT_RECORDS}-record limit.")
     accepted: list[MarketSpec] = []
     rejected: list[dict[str, str]] = []
     for raw in records:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -98,7 +99,19 @@ def verify_shadow_log(path: str | Path) -> tuple[pd.DataFrame, dict[str, float]]
     source = Path(path)
     if not source.exists():
         raise FileNotFoundError(f"Shadow log not found: {source}")
-    records = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
+    records: list[dict] = []
+    malformed_lines: list[int] = []
+    for line_number, line in enumerate(source.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError:
+            malformed_lines.append(line_number)
+    if malformed_lines:
+        logging.getLogger(__name__).error(
+            "Skipped %d malformed line(s) in shadow log %s: %s", len(malformed_lines), source, malformed_lines
+        )
     if not records:
         raise ValueError("Shadow log contains no forecast records.")
     forecasts = pd.DataFrame(records)

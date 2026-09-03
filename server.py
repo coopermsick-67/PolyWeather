@@ -9,6 +9,7 @@ hosted deployment (see DEPLOY.md). Run locally with:
 
 from __future__ import annotations
 
+import os
 from datetime import date
 
 from flask import Flask, jsonify, request
@@ -17,7 +18,12 @@ from flask_cors import CORS
 from polyweather.dashboard_payload import dashboard_today, payload
 
 app = Flask(__name__)
-CORS(app)
+
+# Only the configured dashboard origin(s) may call this API in production.
+# Set ALLOWED_ORIGINS to a comma-separated list (e.g. the deployed dashboard
+# URL); unset it locally to allow any origin during development.
+_allowed_origins = os.environ.get("ALLOWED_ORIGINS")
+CORS(app, origins=_allowed_origins.split(",") if _allowed_origins else "*")
 
 
 @app.get("/api/dashboard")
@@ -29,9 +35,12 @@ def dashboard() -> tuple:
         return jsonify({"error": f"Invalid date {raw_date!r}. Use YYYY-MM-DD."}), 400
     try:
         return jsonify(payload(target_date))
-    except Exception as exc:  # noqa: BLE001 - API boundary: never leak a bare 500
+    except ValueError as exc:
+        # Caller-facing validation errors (bad date range, etc.) are safe to surface.
+        return jsonify({"error": str(exc)}), 400
+    except Exception:  # noqa: BLE001 - API boundary: never leak internals in a 500
         app.logger.exception("Failed to build dashboard payload for %s", target_date)
-        return jsonify({"error": str(exc)}), 500
+        return jsonify({"error": "The forecast service is temporarily unavailable. Try again shortly."}), 500
 
 
 @app.get("/healthz")
@@ -40,4 +49,5 @@ def healthz() -> tuple:
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=8000, debug=True)
+    debug = os.environ.get("FLASK_DEBUG") == "1"
+    app.run(host="127.0.0.1", port=8000, debug=debug)
