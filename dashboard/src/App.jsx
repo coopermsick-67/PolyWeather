@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
-  ArrowRight, CalendarDays, CheckCircle2, ChevronDown, ChevronRight,
-  CloudSun, Menu, Moon, RefreshCw, ShieldCheck, SunMedium, X,
+  ArrowRight, BarChart3, Bell, CalendarDays, CheckCircle2, ChevronDown, ChevronRight,
+  CloudSun, Database, FileText, Menu, Moon, RefreshCw, Settings, ShieldCheck, SunMedium, X,
 } from 'lucide-react'
 import { getDashboard } from './api'
+import { addDays, dateChoice, isoToday, longDate, shortDate } from './dateUtils'
 import ForecastBrief from './components/ForecastBrief'
 import ForecastControls from './components/ForecastControls'
 import ForecastPreview from './components/ForecastPreview'
@@ -14,13 +15,7 @@ import StationInsight from './components/StationInsight'
 import AccuracyPanel from './components/AccuracyPanel'
 import StatusPanel from './components/StatusPanel'
 import TrendChart from './components/TrendChart'
-
-const MIN_REFRESH_MS = 15_000
-const MAX_REFRESH_MS = 30_000
-
-function wait(ms) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms))
-}
+import BacktestWorkspace from './components/BacktestWorkspace'
 
 function formatStationList(registry, limit = 8) {
   if (!registry?.length) return null
@@ -32,42 +27,11 @@ function formatStationList(registry, limit = 8) {
   return remaining > 0 ? `${list}, plus ${remaining} more` : list
 }
 
-function formatIso(date) {
-  const month = String(date.getMonth() + 1).padStart(2, '0')
-  const day = String(date.getDate()).padStart(2, '0')
-  return `${date.getFullYear()}-${month}-${day}`
-}
-
-function isoToday() {
-  const now = new Date()
-  return formatIso(new Date(now.getFullYear(), now.getMonth(), now.getDate()))
-}
-
-function addDays(iso, days) {
-  const date = new Date(`${iso}T12:00:00`)
-  date.setDate(date.getDate() + days)
-  return formatIso(date)
-}
-
-function longDate(iso) {
-  return new Date(`${iso}T12:00:00`).toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })
-}
-
-function shortDate(iso) {
-  return new Date(`${iso}T12:00:00`).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
-}
-
-function dateChoice(iso, today) {
-  const offset = Math.round((new Date(`${iso}T12:00:00`) - new Date(`${today}T12:00:00`)) / 86400000)
-  if (offset === 0) return 'Today'
-  if (offset === 1) return 'Tomorrow'
-  return new Date(`${iso}T12:00:00`).toLocaleDateString('en-US', { weekday: 'short', day: 'numeric' })
-}
-
 function useRoute() {
-  const [route, setRoute] = useState(() => window.location.hash === '#/forecast' ? 'forecast' : 'home')
+  const readRoute = () => ['forecast', 'backtest'].includes(window.location.hash.slice(2)) ? window.location.hash.slice(2) : 'home'
+  const [route, setRoute] = useState(readRoute)
   useEffect(() => {
-    const change = () => setRoute(window.location.hash === '#/forecast' ? 'forecast' : 'home')
+    const change = () => setRoute(readRoute())
     window.addEventListener('hashchange', change)
     return () => window.removeEventListener('hashchange', change)
   }, [])
@@ -76,23 +40,35 @@ function useRoute() {
 
 function initialTheme() {
   try {
-    const saved = window.localStorage.getItem('polyweather-theme')
+    const saved = window.localStorage.getItem('weatherpicks-theme')
     if (saved === 'light' || saved === 'dark') return saved
   } catch { /* Storage can be unavailable in private browsing contexts. */ }
-  return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+  return 'dark'
 }
 
 function useTheme() {
   const [theme, setTheme] = useState(initialTheme)
   useEffect(() => {
     document.documentElement.dataset.theme = theme
-    try { window.localStorage.setItem('polyweather-theme', theme) } catch { /* Preference remains for this visit. */ }
+    try { window.localStorage.setItem('weatherpicks-theme', theme) } catch { /* Preference remains for this visit. */ }
   }, [theme])
   return [theme, () => setTheme((current) => current === 'dark' ? 'light' : 'dark')]
 }
 
 function Logo() {
-  return <a className="brand" href="#/" aria-label="PolyWeather home"><CloudSun aria-hidden="true" /><span>PolyWeather</span></a>
+  return <a className="brand" href="#/" aria-label="WeatherPicks home"><CloudSun aria-hidden="true" /><span>WeatherPicks</span></a>
+}
+
+function WorkspaceNav({ route, theme, onThemeToggle }) {
+  return <aside className="workspace-nav"><Logo /><nav aria-label="Workspace navigation">
+    <a href="#/" className={route === 'home' ? 'active' : ''}><BarChart3 size={19} /><span>Overview</span></a>
+    <a href="#/forecast" className={route === 'forecast' ? 'active' : ''}><CloudSun size={19} /><span>Forecasts</span></a>
+    <a href="#/backtest" className={route === 'backtest' ? 'active' : ''}><BarChart3 size={19} /><span>Backtest</span></a>
+    <a href="#/backtest"><Database size={19} /><span>Datasets</span></a>
+    <a href="#/forecast"><Bell size={19} /><span>Alerts</span></a>
+    <a href="#/accuracy"><FileText size={19} /><span>Reports</span></a>
+    <a href="#/how-it-works"><Settings size={19} /><span>Settings</span></a>
+  </nav><div className="workspace-nav-bottom"><button type="button" onClick={onThemeToggle}><Moon size={18} /><span>{theme === 'dark' ? 'Dark theme' : 'Light theme'}</span></button><span className="workspace-account">WP <small>WeatherPicks workspace</small></span></div></aside>
 }
 
 function AppHeader({ route, selectedDate, today, maxDate, onDateChange, onRefresh, loading, theme, onThemeToggle }) {
@@ -110,6 +86,7 @@ function AppHeader({ route, selectedDate, today, maxDate, onDateChange, onRefres
           <a href="#/how-it-works" onClick={close}>How it works</a>
           <a href="#/accuracy" onClick={close}>Accuracy</a>
           <a className={isForecast ? 'active' : ''} href="#/forecast" onClick={close}>Dashboard</a>
+          <a className={route === 'backtest' ? 'active' : ''} href="#/backtest" onClick={close}>Backtest</a>
         </nav>
         <div className="header-actions">
           {isForecast && <label className="date-control"><CalendarDays size={17} /><input aria-label="Forecast date" type="date" min={today} max={maxDate} value={selectedDate} onChange={(event) => onDateChange(event.target.value)} /><span>{longDate(selectedDate)}</span><ChevronDown size={16} /></label>}
@@ -132,20 +109,20 @@ function HomePage({ data, loading, error }) {
   const stationCopy = stationCount ? `${stationCount} settlement stations` : 'settlement stations across the U.S.'
   const stationList = formatStationList(registry)
   const faqs = [
-    ['Which locations are included?', stationList ? `PolyWeather follows ${stationList}.` : 'PolyWeather follows a configured registry of settlement stations across the U.S. Open the dashboard to see the current list.'],
+    ['Which locations are included?', stationList ? `WeatherPicks follows ${stationList}.` : 'WeatherPicks follows a configured registry of settlement stations across the U.S. Open the board to see the current list.'],
     ['What does the 4° range mean?', 'It is a fixed ±2°F planning band around the displayed high. In the untouched historical candidate backtest, it contained the observed high 67% of the time—not a guarantee for today.'],
     ['How often do forecasts update?', 'The dashboard recomputes from available forecast guidance when you refresh. Small one-degree shifts are intentionally held to keep the display stable.'],
-    ['Is this an official weather forecast?', 'No. PolyWeather is an independent model. It is best used alongside official National Weather Service guidance for weather-safety decisions.'],
+    ['Are these guaranteed picks?', 'No. WeatherPicks is research only, not betting, financial, or weather-safety advice. Forecasts are experimental; verify settlement rules and official NWS guidance before acting.'],
   ]
   return (
     <main>
       <section className="home-hero" aria-labelledby="hero-title">
         <div className="page-width hero-grid">
           <div className="hero-copy">
-            <h1 id="hero-title">Know the high.<br />Plan with confidence.</h1>
-            <p>Experimental daily-high estimates for {stationCopy}—built for the one number that shapes your day.</p>
-            <div className="hero-actions"><a className="button" href="#/forecast">View today’s forecast <ArrowRight size={18} /></a><a className="text-link" href="#/how-it-works">See how it works <ArrowRight size={16} /></a></div>
-            <p className="hero-note"><span />Model ranges and performance monitoring are shown alongside every forecast.</p>
+            <h1 id="hero-title">Weather picks,<br />with the evidence in view.</h1>
+            <p>Independent daily-high research for {stationCopy}. Compare the settlement station, forecast range, source coverage, and monitored history before sharing or selling a weather pick.</p>
+            <div className="hero-actions"><a className="button" href="#/forecast">Explore today’s board <ArrowRight size={18} /></a><a className="text-link" href="#/backtest">Review the backtest <ArrowRight size={16} /></a></div>
+            <p className="hero-note"><span />Information only—not betting, financial, or weather-safety advice. Outcomes are not guaranteed.</p>
           </div>
           <ForecastPreview data={data} loading={loading} error={error} />
         </div>
@@ -153,28 +130,28 @@ function HomePage({ data, loading, error }) {
 
       <section className="home-section matter-section">
         <div className="page-width two-column">
-          <div><p className="section-label">WHY DAILY HIGHS</p><h2>One clear view of the temperature that matters most.</h2></div>
+          <div><p className="section-label">THE PICK RESEARCH BOARD</p><h2>Build a weather pick from the evidence, not a single number.</h2></div>
           <div className="benefit-list">
-            <div><SunMedium aria-hidden="true" /><div><h3>Plan your day</h3><p>Know what to expect before you get dressed, travel, or set your schedule.</p></div></div>
-            <div><CalendarDays aria-hidden="true" /><div><h3>See a full week ahead</h3><p>Move from today through the next seven days without resetting anything.</p></div></div>
-            <div><ShieldCheck aria-hidden="true" /><div><h3>Use a four-degree planning range</h3><p>Each forecast pairs a whole-degree prediction with a fixed ±2°F range and its historical coverage.</p></div></div>
+            <div><SunMedium aria-hidden="true" /><div><h3>Know the settlement station</h3><p>Read the mapped location and local-date high before you compare any weather market rule.</p></div></div>
+            <div><CalendarDays aria-hidden="true" /><div><h3>See the forecast context</h3><p>Compare the daily high, model spread, observations, and next seven days in one board.</p></div></div>
+            <div><ShieldCheck aria-hidden="true" /><div><h3>Verify the history</h3><p>Run the exact held-out backtest before treating any model signal as useful research.</p></div></div>
           </div>
         </div>
       </section>
 
       <section id="how-it-works" className="home-section how-section">
-        <div className="page-width"><p className="section-label">HOW IT WORKS</p><h2>Forecasts with context, not false certainty.</h2>
+        <div className="page-width"><p className="section-label">HOW TO REVIEW A PICK</p><h2>Evidence first. Certainty never.</h2>
           <div className="steps">
             <article><span>01</span><h3>Read available weather guidance</h3><p>The model begins with time-aware forecast guidance and station-specific features.</p></article>
             <article><span>02</span><h3>Calibrate the daily high</h3><p>It learns a location-aware correction to the underlying forecast rather than predicting from scratch.</p></article>
-            <article><span>03</span><h3>Show the number and its range</h3><p>You get a whole-degree high, a practical ±2°F planning range, and the wider calibrated model range.</p></article>
+            <article><span>03</span><h3>Review the range and history</h3><p>Use the range, source quality, and backtest—then make your own decision. No result is guaranteed.</p></article>
           </div>
         </div>
       </section>
 
       <section id="accuracy" className="home-section method-section">
         <div className="page-width method-grid">
-          <div><p className="section-label">MODEL TRANSPARENCY</p><h2>We monitor the forecast after it is made.</h2><p>Forecasts are stored before the outcome is known, then scored against official daily observations. That keeps the performance view honest.</p><a className="text-link" href="#/forecast">Explore performance <ArrowRight size={16} /></a></div>
+          <div><p className="section-label">MODEL TRANSPARENCY</p><h2>Every weather pick should survive a backtest.</h2><p>Forecasts are stored before the outcome is known, then scored against official daily observations. That makes the research reviewable instead of promotional.</p><a className="text-link" href="#/backtest">Run the backtest <ArrowRight size={16} /></a></div>
           <div className="method-panel"><CheckCircle2 /><div><strong>Daily high, local date</strong><span>Labels are official daily observations—not a max of rounded reports.</span></div><div><strong>Stable by design</strong><span>Small input changes do not churn the number every refresh.</span></div><div><strong>Shadow monitoring</strong><span>Performance is shown as monitored evidence, not a blanket accuracy promise.</span></div></div>
         </div>
       </section>
@@ -185,7 +162,7 @@ function HomePage({ data, loading, error }) {
         </div>
       </section>
 
-      <section className="final-cta"><div className="page-width final-cta-inner"><div><CloudSun /><div><h2>Know the high. Plan with confidence.</h2><p>Open the daily forecast for {stationCount ? `all ${stationCount} locations` : 'every configured location'}.</p></div></div><a className="button" href="#/forecast">View today’s forecast <ArrowRight size={18} /></a></div></section>
+      <section className="final-cta"><div className="page-width final-cta-inner"><div><CloudSun /><div><h2>Review the weather evidence before the pick.</h2><p>Forecasts are experimental research—not a guarantee, recommendation, or safety advisory.</p></div></div><a className="button" href="#/forecast">Explore today’s board <ArrowRight size={18} /></a></div></section>
     </main>
   )
 }
@@ -234,18 +211,14 @@ export default function App() {
   const today = data?.today && data.today >= clockDate ? data.today : clockDate
   const maxDate = data?.maxDate ?? addDays(today, 7)
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (force = false) => {
     requestController.current?.abort()
     const controller = new AbortController()
     requestController.current = controller
     setLoading(true)
     setError('')
-    const minDuration = MIN_REFRESH_MS + Math.random() * (MAX_REFRESH_MS - MIN_REFRESH_MS)
-    const startedAt = Date.now()
     try {
-      const next = await getDashboard(selectedDate, { signal: controller.signal })
-      const elapsed = Date.now() - startedAt
-      if (elapsed < minDuration) await wait(minDuration - elapsed)
+      const next = await getDashboard(selectedDate, { signal: controller.signal, force })
       if (requestController.current !== controller) return
       setData(next)
       if (selectedDate < next.today) setSelectedDate(next.today)
@@ -256,7 +229,7 @@ export default function App() {
     }
   }, [selectedDate])
 
-  useEffect(() => { void refresh() }, [refresh])
+  useEffect(() => { void refresh(false) }, [refresh])
   useEffect(() => () => requestController.current?.abort(), [])
   useEffect(() => {
     if (!selectedStation && (data?.stationRegistry?.length || data?.forecasts?.length)) setSelectedStation(data.stationRegistry?.[0]?.stationId ?? data.forecasts[0].station)
@@ -269,13 +242,18 @@ export default function App() {
     }, 60_000)
     return () => window.clearInterval(timer)
   }, [])
+  useEffect(() => {
+    const timer = window.setInterval(() => { void refresh(false) }, 15 * 60 * 1000)
+    return () => window.clearInterval(timer)
+  }, [refresh])
 
   const copySummary = async () => {
     const day = longDate(selectedDate)
     const lines = (data?.forecasts ?? []).map((forecast) => `${forecast.station}: ${forecast.highF}°F · planning ${forecast.fourDegreeRangeLowF}°–${forecast.fourDegreeRangeHighF}°`).join('\n')
     try {
-      await navigator.clipboard.writeText(`PolyWeather experimental forecast · ${day}\n${lines}`)
+      await navigator.clipboard.writeText(`WeatherPicks experimental research · ${day}\n${lines}`)
     } catch { setError('Could not copy the planning range. Select the forecast values directly instead.') }
   }
-  return <div className="app"><a className="skip-link" href="#main-content">Skip to content</a><AppHeader route={route} selectedDate={selectedDate} today={today} maxDate={maxDate} onDateChange={setSelectedDate} onRefresh={refresh} loading={loading} theme={theme} onThemeToggle={toggleTheme} /><div id="main-content">{route === 'forecast' ? <ForecastPage data={data} selectedDate={selectedDate} today={today} maxDate={maxDate} onSelectDate={setSelectedDate} loading={loading} error={error} onRefresh={refresh} selectedStation={selectedStation} onSelectStation={setSelectedStation} stationFilter={stationFilter} onStationFilter={setStationFilter} showBaseline={showBaseline} onShowBaseline={setShowBaseline} onCopy={copySummary} /> : <HomePage data={data} loading={loading} error={error} />}</div><footer className="site-footer"><div className="page-width"><Logo /><div><a href="#/how-it-works">How it works</a><a href="#/accuracy">Model notes</a><a href="#/forecast">Dashboard</a></div><p>Independent forecast workspace. Use official guidance for weather-safety decisions.</p></div></footer></div>
+  const forceRefresh = () => { void refresh(true) }
+  return <div className="app app-shell"><a className="skip-link" href="#main-content">Skip to content</a><WorkspaceNav route={route} theme={theme} onThemeToggle={toggleTheme} /><div className="workspace-content"><AppHeader route={route} selectedDate={selectedDate} today={today} maxDate={maxDate} onDateChange={setSelectedDate} onRefresh={forceRefresh} loading={loading} theme={theme} onThemeToggle={toggleTheme} /><div id="main-content">{route === 'forecast' ? <ForecastPage data={data} selectedDate={selectedDate} today={today} maxDate={maxDate} onSelectDate={setSelectedDate} loading={loading} error={error} onRefresh={forceRefresh} selectedStation={selectedStation} onSelectStation={setSelectedStation} stationFilter={stationFilter} onStationFilter={setStationFilter} showBaseline={showBaseline} onShowBaseline={setShowBaseline} onCopy={copySummary} /> : route === 'backtest' ? <BacktestWorkspace registry={data?.stationRegistry ?? []} /> : <HomePage data={data} loading={loading} error={error} />}</div><footer className="site-footer"><div className="page-width"><Logo /><div><a href="#/how-it-works">How it works</a><a href="#/accuracy">Model notes</a><a href="#/forecast">Forecast board</a><a href="#/backtest">Backtest</a></div><p>Experimental research only—not betting, financial, or weather-safety advice.</p></div></footer></div></div>
 }

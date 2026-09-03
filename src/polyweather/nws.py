@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -16,6 +17,11 @@ from .stations import Station
 
 NWS_BASE_URL = "https://api.weather.gov"
 MAX_CACHE_ENTRIES = 256
+# NWS asks API consumers to identify themselves with a real contact so they
+# can reach the operator about problem traffic; https://www.weather.gov/documentation/services-web-api
+# Override via NWS_USER_AGENT in any deployment that has a real contact
+# point, rather than shipping the placeholder to production indefinitely.
+DEFAULT_USER_AGENT = os.environ.get("NWS_USER_AGENT", "PolyWeather/0.2 (set NWS_USER_AGENT to a real contact)")
 
 
 @dataclass(frozen=True)
@@ -30,7 +36,7 @@ class SourceSnapshot:
 class NWSClient:
     """NWS client suitable for interactive use, never a settlement authority by itself."""
 
-    def __init__(self, user_agent: str = "PolyWeather/0.2 (weather-research@example.com)", timeout_s: float = 20, cache_ttl_s: int = 120) -> None:
+    def __init__(self, user_agent: str = DEFAULT_USER_AGENT, timeout_s: float = 20, cache_ttl_s: int = 120) -> None:
         self.user_agent = user_agent
         self.timeout_s = timeout_s
         self.cache_ttl_s = cache_ttl_s

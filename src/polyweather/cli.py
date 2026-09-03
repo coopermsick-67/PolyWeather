@@ -117,6 +117,9 @@ def command_train(args: argparse.Namespace) -> None:
 
 
 def command_predict(args: argparse.Namespace) -> None:
+    # args.model is a local CLI flag supplied by the operator running this
+    # command, not remote/request-controlled input; joblib.load still runs
+    # pickle deserialization, so only ever point --model at trusted artifacts.
     model = joblib.load(args.model)
     target_date = args.target_date or (date.today() + timedelta(days=1))
     requested = _requested_stations(args.stations, args.model)
@@ -156,6 +159,9 @@ def command_quality(args: argparse.Namespace) -> None:
 
 
 def command_log_current(args: argparse.Namespace) -> None:
+    # args.model is a local CLI flag supplied by the operator running this
+    # command, not remote/request-controlled input; joblib.load still runs
+    # pickle deserialization, so only ever point --model at trusted artifacts.
     model = joblib.load(args.model)
     target_date = args.target_date or (date.today() + timedelta(days=1))
     requested = _requested_stations(args.stations, args.model)

@@ -4,8 +4,16 @@ services:
     runtime: python
     plan: free
     buildCommand: pip install -e ".[server]"
-    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --timeout 60
+    # --workers 2 --threads 4 lets one slow upstream NWS/NBM call for one
+    # client not serialize every other concurrent dashboard request behind it.
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --workers 2 --threads 4 --timeout 60
     healthCheckPath: /healthz
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.10
+      # Comma-separated list of origins allowed to call this API (e.g. the
+      # deployed dashboard's URL). Must be set in the Render dashboard or
+      # this env group; left unset here so a wildcard default is never
+      # silently deployed without an explicit choice at set-up time.
+      - key: ALLOWED_ORIGINS
+        sync: false

@@ -72,11 +72,12 @@ export default function IntradayChart({ forecast }) {
     })
   }
   const freshnessLabel = forecast.dataFreshness >= 1 ? 'Fresh' : 'Stale'
+  const hasAgreement = Number.isFinite(forecast.sourceAgreement)
   return <section className="intraday-card" aria-labelledby="intraday-title">
     <div className="intraday-heading">
       <div><p className="section-label">LIVE STATION TRACE</p><h2 id="intraday-title">Intraday temperature</h2><span>{forecast.marketLocation} · {forecast.station}</span></div>
       <div className="intraday-evidence">
-        <div className="evidence-metric"><span>Source agreement</span><div className="evidence-bar"><i style={{ width: `${Math.round(forecast.sourceAgreement * 100)}%` }} /></div><strong>{Math.round(forecast.sourceAgreement * 100)}%</strong></div>
+        <div className="evidence-metric"><span>Source agreement</span>{hasAgreement ? <><div className="evidence-bar"><i style={{ width: `${Math.round(forecast.sourceAgreement * 100)}%` }} /></div><strong>{Math.round(forecast.sourceAgreement * 100)}%</strong></> : <strong>—</strong>}</div>
         <div className={`evidence-pill ${freshnessLabel === 'Fresh' ? 'is-fresh' : 'is-stale'}`}>{freshnessLabel} observation</div>
       </div>
     </div>

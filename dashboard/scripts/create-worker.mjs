@@ -14,6 +14,8 @@ const assetNames = [
   'index.html',
   'dashboard-snapshot.json',
   'xgb-worker-model.json',
+  'backtest-data.json',
+  'backtest-worker.js',
   ...(await readdir(new URL('../dist/assets/', import.meta.url))).map((name) => `assets/${name}`),
 ]
 const contentTypes = {
@@ -34,7 +36,11 @@ const decode = (value) => Uint8Array.from(atob(value), (char) => char.charCodeAt
 const snapshot = JSON.parse(new TextDecoder().decode(decode(assets['/dashboard-snapshot.json'].body)));
 const modelArtifact = JSON.parse(new TextDecoder().decode(decode(assets['/xgb-worker-model.json'].body)));
 const responseCache = new Map();
-const CACHE_TTL_MS = 4 * 60 * 60 * 1000;
+const CACHE_TTL_MS = 15 * 60 * 1000;
+// A complete 20-station, three-model guidance batch can legitimately take
+// longer than a single-point query. Keep the request bounded without forcing
+// the whole dashboard into the lower-information NWS fallback too eagerly.
+const UPSTREAM_TIMEOUT_MS = 12_000;
 const MODELS = ['ncep_nbm_conus', 'ncep_hrrr_conus', 'ncep_gfs_seamless'];
 const WEATHER_VARIABLES = ['temperature_2m', 'dew_point_2m', 'relative_humidity_2m', 'cloud_cover', 'wind_speed_10m', 'wind_direction_10m', 'precipitation', 'shortwave_radiation', 'surface_pressure'];
 
@@ -48,6 +54,16 @@ function addDays(iso, days) {
   const date = new Date(iso + 'T12:00:00Z');
   date.setUTCDate(date.getUTCDate() + days);
   return date.toISOString().slice(0, 10);
+}
+
+async function fetchWithTimeout(input, init = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function finite(values) { return values.filter(Number.isFinite); }
@@ -128,6 +144,34 @@ function modelResidual(features, stationId) {
   return prediction + (modelArtifact.calibrationOffsetByStation[stationId] ?? modelArtifact.calibrationOffset);
 }
 
+function sourceEvidence(features, sourceName) {
+  const highs = MODELS.map((model) => features?.[model + '__tmax_f']).filter(Number.isFinite);
+  const spread = highs.length > 1 ? Math.max(...highs) - Math.min(...highs) : null;
+  return {
+    sourceName,
+    sourceCount: highs.length,
+    modelSpreadF: spread,
+    sourceAgreement: spread === null ? null : Math.max(0, Math.min(1, 1 - spread / 12)),
+    dataFreshness: 1,
+    hasCompleteCoreGuidance: MODELS.every((model) => Number.isFinite(features?.[model + '__tmax_f']) && features?.[model + '__availability'] >= .95),
+  };
+}
+
+function consensusHigh(features) {
+  const nbm = features?.ncep_nbm_conus__tmax_f;
+  const hrrr = features?.ncep_hrrr_conus__tmax_f;
+  const gfs = features?.ncep_gfs_seamless__tmax_f;
+  if (![nbm, hrrr, gfs].every(Number.isFinite)) return nbm;
+  // Archive-tested 50/25/25 consensus: 2.378°F MAE versus 2.651°F raw NBM.
+  return .5 * nbm + .25 * hrrr + .25 * gfs;
+}
+
+function adaptiveHalfWidth(baseHalfWidth, evidence, calibrated) {
+  const spreadPenalty = Number.isFinite(evidence.modelSpreadF) ? Math.min(3, Math.ceil(evidence.modelSpreadF / 3)) : 3;
+  const missingPenalty = evidence.sourceCount >= 3 ? 0 : 2;
+  return Math.max(2, Math.min(8, Math.round(baseHalfWidth + spreadPenalty + missingPenalty + (calibrated ? 0 : 1))));
+}
+
 async function mapWithConcurrency(items, mapper, limit = 4) {
   const results = new Array(items.length).fill(null);
   let nextIndex = 0;
@@ -141,7 +185,7 @@ async function mapWithConcurrency(items, mapper, limit = 4) {
   return results;
 }
 
-async function fetchHourlyForecasts(stations) {
+function hourlyEndpoint(stations) {
   const endpoint = new URL('https://api.open-meteo.com/v1/forecast');
   for (const [key, value] of Object.entries({
     latitude: stations.map((station) => station.latitude).join(','),
@@ -152,23 +196,48 @@ async function fetchHourlyForecasts(stations) {
     forecast_days: '16',
     models: MODELS.join(','),
   })) endpoint.searchParams.set(key, String(value));
-  const response = await fetch(endpoint, { headers: { Accept: 'application/json' } });
-  if (!response.ok) return null;
-  const payload = await response.json();
-  return Array.isArray(payload) ? payload.map((item) => item.hourly ?? {}) : [payload.hourly ?? {}];
+  return endpoint;
+}
+
+async function requestHourlyForecasts(stations) {
+  const endpoint = hourlyEndpoint(stations);
+  try {
+    const response = await fetchWithTimeout(endpoint, { headers: { Accept: 'application/json', 'User-Agent': 'WeatherPicks forecast dashboard' } });
+    if (!response.ok) return null;
+    const payload = await response.json();
+    return Array.isArray(payload) ? payload.map((item) => item.hourly ?? {}) : [payload.hourly ?? {}];
+  } catch {
+    return null;
+  }
+}
+
+async function fetchHourlyForecasts(stations) {
+  const batch = await requestHourlyForecasts(stations);
+  if (batch?.length === stations.length) return batch;
+  // Some edge networks reject a large multi-location query even though the
+  // same provider accepts individual requests. Recover per station rather
+  // than silently switching every city to a single-source NWS fallback.
+  const individual = await mapWithConcurrency(stations, async (station) => {
+    const result = await requestHourlyForecasts([station]);
+    return result?.[0] ?? null;
+  }, 10);
+  return individual.some(Boolean) ? individual : null;
 }
 
 function forecastForStation(station, targetDate, hourly) {
   const features = buildFeatures(hourly, targetDate);
-  const baseline = Math.round(features?.['ncep_nbm_conus__tmax_f']);
-  if (!Number.isFinite(baseline)) throw new Error('No NBM daily high available');
-  const isCalibrated = station.stationId in modelArtifact.calibrationOffsetByStation;
-  const rawHigh = Math.round(isCalibrated ? baseline + modelResidual(features, station.stationId) : baseline);
-  const halfWidth = Math.max(2, Math.round(modelArtifact.conformalHalfwidthByStation[station.stationId] ?? 4));
-  return makeForecast(station, targetDate, baseline, rawHigh, halfWidth, isCalibrated, isCalibrated ? 'Live NCEP NBM, HRRR, and GFS guidance with the validated station residual model.' : 'Live NCEP NBM baseline shown; station-specific calibration is not available.');
+  const nbm = features?.['ncep_nbm_conus__tmax_f'];
+  if (!Number.isFinite(nbm)) throw new Error('No NBM daily high available');
+  const evidence = sourceEvidence(features, 'NCEP NBM, HRRR, and GFS via Open-Meteo');
+  const baseline = Math.round(consensusHigh(features));
+  const isCalibrated = station.stationId in modelArtifact.calibrationOffsetByStation && evidence.hasCompleteCoreGuidance;
+  const rawHigh = Math.round(isCalibrated ? nbm + modelResidual(features, station.stationId) : baseline);
+  const baseHalfWidth = Math.round(modelArtifact.conformalHalfwidthByStation[station.stationId] ?? 4);
+  const halfWidth = adaptiveHalfWidth(baseHalfWidth, evidence, isCalibrated);
+  return makeForecast(station, targetDate, baseline, rawHigh, halfWidth, isCalibrated, isCalibrated ? 'Archive-calibrated residual model applied to complete NBM, HRRR, and GFS guidance.' : evidence.sourceCount >= 3 ? 'Archive-tested NBM/HRRR/GFS weighted consensus shown; this station has no residual-model validation.' : 'Incomplete multi-model guidance; station-specific residual correction is deliberately disabled.', evidence);
 }
 
-function makeForecast(station, targetDate, baseline, rawHigh, halfWidth, isCalibrated, reason) {
+function makeForecast(station, targetDate, baseline, rawHigh, halfWidth, isCalibrated, reason, evidence = {}) {
   const high = rawHigh;
   const prior = snapshot.forecasts.find((forecast) => forecast.station === station.stationId) ?? {};
   return {
@@ -186,32 +255,85 @@ function makeForecast(station, targetDate, baseline, rawHigh, halfWidth, isCalib
     fourDegreeRangeLowF: high - 2,
     fourDegreeRangeHighF: high + 2,
     modelRange: [high - halfWidth, high + halfWidth],
-    uncertainty: halfWidth <= 2 ? 'Low' : 'Moderate',
+    uncertainty: isCalibrated ? (halfWidth <= 2 ? 'Low' : 'Moderate') : 'High',
     isCalibrated,
     currentObservedTemperatureF: null,
     observedHighSoFarF: null,
     observedLowSoFarF: null,
     intradayObservations: [],
     lastObservationAt: null,
-    dataFreshness: 1,
-    sourceAgreement: 1,
+    dataFreshness: evidence.dataFreshness ?? null,
+    sourceAgreement: evidence.sourceAgreement ?? null,
+    sourceCount: evidence.sourceCount ?? 0,
+    modelSpreadF: evidence.modelSpreadF ?? null,
+    sourceName: evidence.sourceName ?? 'Forecast source unavailable',
+    dataQualityStatus: isCalibrated ? 'PROVISIONAL / SHADOW' : 'NO BET / UNVALIDATED',
     reasonCodes: [reason],
-    stabilityReason: 'four_hour_market_update_window',
+    stabilityReason: 'fifteen_minute_market_update_window',
   };
 }
 
 async function nwsForecastForStation(station, targetDate) {
   const grid = station.forecastGrid;
-  const response = await fetch('https://api.weather.gov/gridpoints/' + grid.office + '/' + grid.x + ',' + grid.y + '/forecast', { headers: { Accept: 'application/geo+json', 'User-Agent': 'PolyWeather market forecast' } });
+  const response = await fetchWithTimeout('https://api.weather.gov/gridpoints/' + grid.office + '/' + grid.x + ',' + grid.y + '/forecast', { headers: { Accept: 'application/geo+json', 'User-Agent': 'WeatherPicks market forecast' } });
   if (!response.ok) throw new Error('NWS forecast unavailable');
   const periods = (await response.json()).properties?.periods ?? [];
   const candidates = periods.filter((period) => period.isDaytime && localDate(new Date(period.startTime), station.timezone) === targetDate).map((period) => Number(period.temperature)).filter(Number.isFinite);
   if (!candidates.length) throw new Error('No NWS daily high available');
   const baseline = Math.round(Math.max(...candidates));
-  const adjustment = { KNYC: -2, KMDW: 1, KMIA: 1, KLAX: 4, KSFO: 2 }[station.stationId] ?? 0;
+  const evidence = { dataFreshness: 1, sourceName: 'NOAA/NWS daily forecast', sourceCount: 1, sourceAgreement: null, modelSpreadF: null };
+  const halfWidth = adaptiveHalfWidth(Math.round(modelArtifact.conformalHalfwidthByStation[station.stationId] ?? 4), evidence, false);
+  return makeForecast(station, targetDate, baseline, baseline, halfWidth, false, 'Latest NOAA/NWS daily forecast shown as a single-source fallback; no heuristic residual adjustment is applied.', evidence);
+}
+
+async function stationObservations(station, targetDate, now) {
+  if (localDate(now, station.timezone) !== targetDate) return [];
+  const start = addDays(targetDate, -1) + 'T00:00:00Z';
+  const response = await fetchWithTimeout('https://api.weather.gov/stations/' + station.stationId + '/observations?start=' + encodeURIComponent(start) + '&limit=100', { headers: { Accept: 'application/geo+json', 'User-Agent': 'WeatherPicks market forecast' } });
+  if (!response.ok) return [];
+  return ((await response.json()).features ?? []).map((feature) => {
+    const properties = feature.properties ?? {};
+    const celsius = Number(properties.temperature?.value);
+    return { time: properties.timestamp, temperatureF: Number.isFinite(celsius) ? celsius * 9 / 5 + 32 : NaN };
+  }).filter((item) => item.time && Number.isFinite(item.temperatureF) && localDate(new Date(item.time), station.timezone) === targetDate).sort((a, b) => new Date(a.time) - new Date(b.time));
+}
+
+function applyObservations(forecast, observations) {
+  if (!observations.length) return forecast;
+  const temperatures = observations.map((item) => item.temperatureF);
+  const observedHigh = Math.round(max(temperatures));
+  const observedLow = Math.round(min(temperatures));
+  const current = observations.at(-1);
+  const high = Math.max(forecast.highF, observedHigh);
+  const floorShift = high - forecast.highF;
+  return {
+    ...forecast,
+    highF: high,
+    rawModelHighF: high,
+    rangeLowF: Math.max(observedHigh, forecast.rangeLowF + floorShift),
+    rangeHighF: Math.max(observedHigh, forecast.rangeHighF + floorShift),
+    fourDegreeRangeLowF: Math.max(observedHigh, forecast.fourDegreeRangeLowF + floorShift),
+    fourDegreeRangeHighF: Math.max(observedHigh, forecast.fourDegreeRangeHighF + floorShift),
+    currentObservedTemperatureF: Math.round(current.temperatureF * 10) / 10,
+    observedHighSoFarF: observedHigh,
+    observedLowSoFarF: observedLow,
+    intradayObservations: observations.slice(-48),
+    lastObservationAt: current.time,
+    reasonCodes: [...forecast.reasonCodes, floorShift > 0 ? "Same-station NWS observation set a hard floor on today's high." : "Same-station NWS observations confirm the current forecast remains above the observed high."],
+  };
+}
+
+function cachedForecastForStation(station, targetDate) {
+  const prior = snapshot.forecasts.find((forecast) => forecast.station === station.stationId);
+  const high = Number(prior?.highF);
+  if (!Number.isFinite(high) || targetDate !== snapshot.targetDate) return null;
   const isCalibrated = station.stationId in modelArtifact.calibrationOffsetByStation;
   const halfWidth = Math.max(2, Math.round(modelArtifact.conformalHalfwidthByStation[station.stationId] ?? 4));
-  return makeForecast(station, targetDate, baseline, baseline + adjustment, halfWidth, isCalibrated, isCalibrated ? 'Settlement-aware adjustment applied to the latest NOAA/NWS daily forecast.' : 'Latest NOAA/NWS daily forecast shown without station calibration.');
+  return {
+    ...makeForecast(station, targetDate, high, high, halfWidth, false, 'Live weather guidance is temporarily unavailable. The only same-date published snapshot is marked stale and should not be used as a new forecast.', { dataFreshness: 0, sourceName: 'Last same-date published snapshot', sourceCount: 0, sourceAgreement: null, modelSpreadF: null }),
+    dataFreshness: 0,
+    stabilityReason: 'last_known_market_snapshot',
+  };
 }
 
 async function liveDashboard(targetDate) {
@@ -219,10 +341,20 @@ async function liveDashboard(targetDate) {
   const today = localDate(now, 'America/New_York');
   const resolvedDate = /^\\d{4}-\\d{2}-\\d{2}$/.test(targetDate ?? '') ? targetDate : today;
   const hourlyForecasts = await fetchHourlyForecasts(snapshot.stationRegistry);
-  const forecasts = hourlyForecasts
+  const primaryForecasts = hourlyForecasts
     ? snapshot.stationRegistry.flatMap((station, index) => { try { return [forecastForStation(station, resolvedDate, hourlyForecasts[index] ?? {})]; } catch { return []; } })
-    : await mapWithConcurrency(snapshot.stationRegistry, (station) => nwsForecastForStation(station, resolvedDate));
-  const usableForecasts = forecasts.filter((forecast) => !forecast?.error);
+    : [];
+  const primaryByStation = new Map(primaryForecasts.map((forecast) => [forecast.station, forecast]));
+  const missingStations = snapshot.stationRegistry.filter((station) => !primaryByStation.has(station.stationId));
+  const nwsForecasts = missingStations.length
+    ? await mapWithConcurrency(missingStations, (station) => nwsForecastForStation(station, resolvedDate), 10)
+    : [];
+  const liveForecasts = [...primaryForecasts, ...nwsForecasts.filter((forecast) => !forecast?.error)];
+  const liveByStation = new Map(liveForecasts.map((forecast) => [forecast.station, forecast]));
+  const usableForecasts = snapshot.stationRegistry.map((station) => liveByStation.get(station.stationId) ?? cachedForecastForStation(station, resolvedDate)).filter(Boolean);
+  const observations = await mapWithConcurrency(snapshot.stationRegistry, (station) => stationObservations(station, resolvedDate, now), 8);
+  const observationsByStation = new Map(snapshot.stationRegistry.map((station, index) => [station.stationId, Array.isArray(observations[index]) ? observations[index] : []]));
+  const observedForecasts = usableForecasts.map((forecast) => applyObservations(forecast, observationsByStation.get(forecast.station) ?? []));
   if (!usableForecasts.length) throw new Error('Live market forecast data is temporarily unavailable.');
   return {
     ...snapshot,
@@ -230,35 +362,42 @@ async function liveDashboard(targetDate) {
     today,
     maxDate: addDays(today, 7),
     generatedAt: now.toISOString(),
-    forecasts: usableForecasts,
+    forecasts: observedForecasts,
     marketForecast: true,
-    forecastInputs: hourlyForecasts ? 'Live NCEP NBM, HRRR, and GFS guidance with station-specific residual calibration where validated' : 'Latest NOAA/NWS daily guidance with settlement-aware adjustment where validated',
+    forecastInputs: primaryForecasts.length === snapshot.stationRegistry.length ? 'Live NCEP NBM, HRRR, and GFS guidance with an archive-tested consensus baseline, residual-model quality gates, adaptive uncertainty, and same-station NWS observations for today.' : liveForecasts.length ? 'Live guidance with station-level NOAA/NWS fallback, adaptive uncertainty, and same-station observations where available. A stale snapshot is used only when it matches the requested date.' : 'Live weather guidance is temporarily unavailable.',
     validationTarget: 'Official NOAA/NCEI daily TMAX',
-    releaseStatus: 'Market values are held in four-hour update windows to prevent refresh churn. Uncalibrated stations remain clearly marked as baseline-only.',
+    modelStatus: 'SHADOW_ONLY: residual MOS evaluated historically for KLAX, KMDW, KMIA, KNYC, and KSFO only.',
+    releaseStatus: 'Forecasts revalidate every 15 minutes. Five stations have historical residual-model evaluation; the other configured stations use an archive-tested multi-model consensus when complete guidance is available. Same-station observed highs floor the current-day forecast, and range width expands with disagreement.',
   };
 }
 
-async function dashboardResponse(url, targetDate) {
-  const cacheKey = new Request(url.origin + '/api/dashboard-cache?date=' + encodeURIComponent(targetDate ?? 'today'));
-  if (typeof caches !== 'undefined') {
+function responseHeaders() {
+  return { 'cache-control': 'public, max-age=0, s-maxage=900, must-revalidate' };
+}
+
+async function dashboardResponse(url, targetDate, forceRefresh) {
+  const cacheBucket = Math.floor(Date.now() / CACHE_TTL_MS);
+  const cacheKey = new Request(url.origin + '/api/dashboard-cache?date=' + encodeURIComponent(targetDate ?? 'today') + '&bucket=' + cacheBucket);
+  if (!forceRefresh && typeof caches !== 'undefined') {
     try {
       const cachedResponse = await caches.default.match(cacheKey);
       if (cachedResponse) return cachedResponse;
     } catch { /* Sites may disable the shared cache; the worker cache still prevents refresh churn. */ }
   }
-  const memory = responseCache.get(targetDate ?? 'today');
-  if (memory && Date.now() - memory.createdAt < CACHE_TTL_MS) return Response.json(await memory.value, { headers: { 'cache-control': 'public, max-age=14400, s-maxage=14400' } });
+  const memoryKey = (targetDate ?? 'today') + ':' + cacheBucket;
+  const memory = responseCache.get(memoryKey);
+  if (!forceRefresh && memory && Date.now() - memory.createdAt < CACHE_TTL_MS) return Response.json(await memory.value, { headers: responseHeaders() });
   const value = liveDashboard(targetDate);
-  responseCache.set(targetDate ?? 'today', { createdAt: Date.now(), value });
+  responseCache.set(memoryKey, { createdAt: Date.now(), value });
   try {
     const dashboard = await value;
-    const response = Response.json(dashboard, { headers: { 'cache-control': 'public, max-age=14400, s-maxage=14400' } });
+    const response = Response.json(dashboard, { headers: responseHeaders() });
     if (typeof caches !== 'undefined') {
-      try { await caches.default.put(cacheKey, response.clone()); } catch { /* Use the four-hour worker cache when shared caching is unavailable. */ }
+      try { await caches.default.put(cacheKey, response.clone()); } catch { /* Use the 15-minute worker cache when shared caching is unavailable. */ }
     }
     return response;
   } catch (error) {
-    responseCache.delete(targetDate ?? 'today');
+    responseCache.delete(memoryKey);
     throw error;
   }
 }
@@ -268,7 +407,7 @@ export default {
     const url = new URL(request.url);
     if (url.pathname === '/api/dashboard') {
       try {
-        return await dashboardResponse(url, url.searchParams.get('date'));
+        return await dashboardResponse(url, url.searchParams.get('date'), url.searchParams.get('refresh') === '1');
       } catch (error) {
         return Response.json({ error: error.message || 'Live forecast unavailable.' }, { status: 503, headers: { 'cache-control': 'no-store' } });
       }

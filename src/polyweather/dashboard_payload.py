@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -55,10 +56,19 @@ def validate_dashboard_date(target_date: date) -> None:
         )
 
 
+STALE_LOCK_AGE_S = 30.0
+
+
 @contextlib.contextmanager
 def _state_file_lock(path: Path, timeout_s: float = 5.0) -> Iterator[None]:
     """A simple cross-platform exclusive lock so concurrent workers do not
-    interleave read-modify-write cycles on the shared stability-state file."""
+    interleave read-modify-write cycles on the shared stability-state file.
+
+    A lock older than STALE_LOCK_AGE_S is assumed to be an orphan left by a
+    crashed/killed worker (this critical section does no network I/O, so a
+    legitimately held lock is never anywhere near that old) and is reclaimed
+    rather than left to stall every future request for timeout_s each time.
+    """
     lock_path = path.with_suffix(".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout_s
@@ -67,6 +77,14 @@ def _state_file_lock(path: Path, timeout_s: float = 5.0) -> Iterator[None]:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR)
         except FileExistsError:
+            try:
+                age_s = time.time() - lock_path.stat().st_mtime
+            except OSError:
+                age_s = 0.0
+            if age_s > STALE_LOCK_AGE_S:
+                with contextlib.suppress(OSError):
+                    lock_path.unlink()
+                continue
             if time.monotonic() >= deadline:
                 # Proceed without the lock rather than blocking a request
                 # forever on a stale lock file.
@@ -142,6 +160,12 @@ def stabilize_display_high(
     return candidate, "material_model_change"
 
 
+# These three read fixed backtest-artifact files (PREDICTIONS_PATH,
+# STATION_METRICS_PATH, OVERALL_METRICS_PATH) that only change when a new
+# model is deployed, which restarts the process and clears this cache.
+# Without caching, every single /api/dashboard request re-read and
+# re-parsed the same CSV/parquet files for no reason.
+@functools.lru_cache(maxsize=1)
 def _trend() -> dict[str, list[float] | list[str]]:
     rows = pd.read_parquet(PREDICTIONS_PATH).copy()
     rows["target_date"] = pd.to_datetime(rows["target_date"])
@@ -155,6 +179,7 @@ def _trend() -> dict[str, list[float] | list[str]]:
     }
 
 
+@functools.lru_cache(maxsize=1)
 def _accuracy() -> list[dict[str, Any]]:
     """Expose the audited station ranking rather than presenting a generic score."""
     metrics = pd.read_csv(STATION_METRICS_PATH)
@@ -173,6 +198,7 @@ def _accuracy() -> list[dict[str, Any]]:
     ]
 
 
+@functools.lru_cache(maxsize=1)
 def _model_evidence() -> dict[str, float | int]:
     metrics = pd.read_csv(OVERALL_METRICS_PATH)
     candidate = metrics.loc[metrics["model"].eq("XGBoost residual")].iloc[0]
@@ -226,6 +252,11 @@ def _model_stations(model_path: Path) -> list[Any]:
 def payload(target_date: date) -> dict:
     validate_dashboard_date(target_date)
     model_path = MODEL_PATH if MODEL_PATH.exists() else ADAPTIVE_MODEL_PATH if ADAPTIVE_MODEL_PATH.exists() else FALLBACK_MODEL_PATH
+    # joblib.load runs pickle deserialization, which can execute arbitrary
+    # code for a crafted file. Safe only because model_path is fixed to
+    # artifacts/ committed by this repo's own training pipeline, never a
+    # user- or request-supplied path. Do not let model_path become dynamic
+    # without adding integrity verification (e.g. a signed checksum).
     model: ResidualForecaster | AdaptiveResidualForecaster | BlendedResidualForecaster = joblib.load(model_path)
     model_version = hashlib.sha256(model_path.read_bytes()).hexdigest()[:16]
     model_stations = _model_stations(model_path)
@@ -240,8 +271,16 @@ def payload(target_date: date) -> dict:
     # done outside the state-file lock so concurrent requests don't serialize
     # on network I/O, only on the brief local read-modify-write below.
     with ThreadPoolExecutor(max_workers=min(8, len(display_stations))) as executor:
-        futures = [executor.submit(_fetch_live_inputs, station, target_date) for station in display_stations]
-        live_inputs = [future.result() for future in futures]
+        future_by_station = {
+            executor.submit(_fetch_live_inputs, station, target_date): station for station in display_stations
+        }
+        live_inputs = []
+        for future in future_by_station:
+            try:
+                live_inputs.append(future.result())
+            except Exception:  # noqa: BLE001 - one station's upstream failure must not sink the whole payload
+                station = future_by_station[future]
+                logging.getLogger(__name__).exception("Live data fetch failed for %s; omitting from this response.", station.icao)
     with _state_file_lock(STABILITY_STATE_PATH):
         stability_state = _load_stability_state()
         _prune_stability_state(stability_state, dashboard_today())
@@ -279,7 +318,7 @@ def _build_forecasts(
         observed_high = observation.get("observedDailyHighF") if observation else None
         observed_low = observation.get("observedDailyLowF") if observation else None
         current_temperature = observation.get("currentObservedTemperatureF") if observation else None
-        candidate_high = int(np.rint(max(predicted_high, observed_high or float("-inf"))))
+        candidate_high = int(np.rint(max(predicted_high, observed_high if observed_high is not None else float("-inf"))))
         observed_high_rounded = int(np.rint(observed_high)) if observed_high is not None else None
         # A model upgrade should not inherit a display value held from the
         # previous artifact. Within one artifact, the existing two-degree

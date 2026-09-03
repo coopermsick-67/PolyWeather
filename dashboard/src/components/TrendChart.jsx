@@ -25,7 +25,7 @@ export default function TrendChart({ trend }) {
     <section className="trend-panel" aria-labelledby="trend-heading">
       <div className="trend-heading">
         <div><h2 id="trend-heading">Shadow monitoring</h2><p>14-day rolling error · mean absolute error (°F)</p></div>
-        <div className="legend"><span><i className="candidate" />PolyWeather candidate</span><span><i className="baseline" />Raw NBM baseline</span></div>
+        <div className="legend"><span><i className="candidate" />WeatherPicks candidate</span><span><i className="baseline" />Raw NBM baseline</span></div>
       </div>
       <div className="chart-wrap">
         <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Rolling forecast error trend">

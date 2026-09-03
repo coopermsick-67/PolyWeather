@@ -29,6 +29,15 @@ export default function LocationPicker({ stations, value, onChange, allowAll = f
     return stations.filter((station) => `${station.display_name} ${station.stationId} ${station.name}`.toLowerCase().includes(normalized))
   }, [stations, query])
 
+  // The typed query can shrink the list on every keystroke; clamp instead of
+  // leaving activeIndex pointing at an option that no longer exists.
+  useEffect(() => {
+    setActiveIndex((prev) => {
+      const optionCount = filtered.length + (allowAll ? 1 : 0)
+      return prev >= optionCount ? optionCount - 1 : prev
+    })
+  }, [filtered, allowAll])
+
   const options = useMemo(
     () => (allowAll ? [{ stationId: null, display_name: allLabel, name: '' }, ...filtered] : filtered),
     [allowAll, allLabel, filtered]
@@ -64,15 +73,15 @@ export default function LocationPicker({ stations, value, onChange, allowAll = f
       <span>{label}</span>
       <ChevronDown size={15} aria-hidden="true" className={open ? 'flip' : ''} />
     </button>
-    {open && <div className="location-picker-panel" role="listbox" aria-label="Choose a settlement station">
-      <div className="location-picker-search"><Search size={14} aria-hidden="true" /><input ref={inputRef} type="text" placeholder="Search city or station code" value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={onKeyDown} /></div>
+    {open && <div className="location-picker-panel" role="listbox" aria-label="Choose a settlement station" id="location-picker-listbox">
+      <div className="location-picker-search"><Search size={14} aria-hidden="true" /><input ref={inputRef} type="text" placeholder="Search city or station code" value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={onKeyDown} role="combobox" aria-expanded="true" aria-controls="location-picker-listbox" aria-activedescendant={activeIndex >= 0 ? `location-picker-option-${activeIndex}` : undefined} /></div>
       <div className="location-picker-list">
-        {allowAll && <button type="button" role="option" aria-selected={value == null} className={[value == null && 'selected', activeIndex === 0 && 'is-active'].filter(Boolean).join(' ')} onClick={() => select(null)}><span className="location-picker-name">{allLabel}</span></button>}
+        {allowAll && <button id="location-picker-option-0" type="button" role="option" aria-selected={value == null} className={[value == null && 'selected', activeIndex === 0 && 'is-active'].filter(Boolean).join(' ')} onClick={() => select(null)}><span className="location-picker-name">{allLabel}</span></button>}
         {filtered.length === 0 && <p className="location-picker-empty">No locations match “{query}”.</p>}
         {filtered.map((station, index) => {
           const calibrated = calibratedIds?.has(station.stationId)
           const optionIndex = allowAll ? index + 1 : index
-          return <button key={station.stationId} type="button" role="option" aria-selected={value === station.stationId} className={[value === station.stationId && 'selected', activeIndex === optionIndex && 'is-active'].filter(Boolean).join(' ')} onClick={() => select(station.stationId)}>
+          return <button id={`location-picker-option-${optionIndex}`} key={station.stationId} type="button" role="option" aria-selected={value === station.stationId} className={[value === station.stationId && 'selected', activeIndex === optionIndex && 'is-active'].filter(Boolean).join(' ')} onClick={() => select(station.stationId)}>
             <span className={calibratedIds ? `location-picker-dot ${calibrated ? 'is-calibrated' : ''}` : 'sr-only'} aria-hidden="true" title={calibratedIds ? (calibrated ? 'Calibrated model' : 'Live baseline, not yet calibrated') : undefined} />
             <span className="location-picker-name">{station.display_name}<small>{station.name}</small></span>
             <span className="location-picker-code">{station.stationId}</span>

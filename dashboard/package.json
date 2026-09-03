@@ -1,19 +1,20 @@
 {
-  "name": "polyweather-dashboard",
+  "name": "weatherpicks-dashboard",
   "private": true,
   "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "vite build && node scripts/create-worker.mjs",
-    "preview": "vite preview"
+    "build": "python scripts/export_backtest_data.py && vite build && node scripts/create-worker.mjs",
+    "preview": "vite preview",
+    "test": "node --test src/**/*.test.js"
   },
   "dependencies": {
-    "@openai/sites-vite-plugin": "^0.2.0",
-    "@vitejs/plugin-react": "^6.0.5",
-    "lucide-react": "^1.31.0",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8",
-    "vite": "^8.2.1"
+    "@openai/sites-vite-plugin": "0.2.0",
+    "@vitejs/plugin-react": "6.0.5",
+    "lucide-react": "1.31.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "vite": "8.2.1"
   }
 }
