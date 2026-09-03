@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import time
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
@@ -52,12 +54,52 @@ class SourceError(RuntimeError):
     """Raised when an upstream weather source cannot provide required data."""
 
 
-def _request_json(url: str, params: dict, retries: int = 3) -> dict | list:
+class _RequestPacer:
+    """Process-wide pacing for public weather endpoints.
+
+    Previous Runs is a shared public service. A multi-station backfill must
+    pace *all* worker threads together or it will be throttled and produce a
+    selectively incomplete historical sample.
+    """
+
+    def __init__(self) -> None:
+        self._lock = Lock()
+        self._next_allowed_at = 0.0
+
+    def wait(self, minimum_interval_seconds: float) -> None:
+        with self._lock:
+            now = time.monotonic()
+            delay = max(0.0, self._next_allowed_at - now)
+            self._next_allowed_at = max(now, self._next_allowed_at) + minimum_interval_seconds
+        if delay:
+            time.sleep(delay)
+
+
+_PREVIOUS_RUNS_PACER = _RequestPacer()
+
+
+def _request_json(
+    url: str,
+    params: dict,
+    retries: int = 6,
+    minimum_interval_seconds: float = 0.0,
+) -> dict | list:
     error: Exception | None = None
     headers = {"User-Agent": "PolyWeather/0.1 (research temperature forecast system)"}
     for attempt in range(retries):
         try:
+            if minimum_interval_seconds:
+                _PREVIOUS_RUNS_PACER.wait(minimum_interval_seconds)
             response = requests.get(url, params=params, headers=headers, timeout=90)
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    pause = max(float(retry_after), 1.0) if retry_after else min(60.0, 4.0 * (attempt + 1))
+                except ValueError:
+                    pause = min(60.0, 4.0 * (attempt + 1))
+                if attempt + 1 < retries:
+                    time.sleep(pause)
+                    continue
             response.raise_for_status()
             payload = response.json()
             if isinstance(payload, dict) and payload.get("error"):
@@ -66,7 +108,7 @@ def _request_json(url: str, params: dict, retries: int = 3) -> dict | list:
         except (requests.RequestException, ValueError, SourceError) as exc:
             error = exc
             if attempt + 1 < retries:
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(min(45.0, 1.5 * (attempt + 1)))
     raise SourceError(f"Request failed for {url}: {error}") from error
 
 
@@ -194,7 +236,9 @@ def fetch_archived_forecast_features(
     lead_days: int = 1,
     models: tuple[str, ...] = MODEL_SOURCES,
     chunk_days: int = 31,
-    max_workers: int = 5,
+    max_workers: int = 2,
+    request_interval_seconds: float = 0.8,
+    cache_dir: str | Path | None = "data/raw/open_meteo_previous_runs",
 ) -> pd.DataFrame:
     """Retrieve vintage-safe station-local forecast features in bounded chunks.
 
@@ -203,40 +247,68 @@ def fetch_archived_forecast_features(
     outcome information. For this first production-ready prototype, all
     stations are evaluated at the same locked 24-hour lead.
     """
+    station_list = list(stations)
+    if not station_list:
+        raise ValueError("At least one settlement station is required.")
     all_frames: list[pd.DataFrame] = []
     model_parameter = ",".join(models)
     variables = ",".join(f"{variable}_previous_day{lead_days}" for variable in ARCHIVED_HOURLY_VARIABLES)
 
-    def fetch_one(station: Station, chunk_start: date, chunk_end: date) -> pd.DataFrame:
+    cache_root = Path(cache_dir) if cache_dir else None
+    if cache_root:
+        cache_root.mkdir(parents=True, exist_ok=True)
+
+    def fetch_one(chunk_start: date, chunk_end: date) -> pd.DataFrame:
+        # Open-Meteo accepts coordinate lists and responds with one payload per
+        # location. Batching the configured settlement stations cuts a
+        # 20-city rebuild from hundreds of public API calls to one call per
+        # date chunk, which is both more reliable and friendlier to the source.
         params = {
-            "latitude": station.latitude,
-            "longitude": station.longitude,
+            "latitude": ",".join(str(station.latitude) for station in station_list),
+            "longitude": ",".join(str(station.longitude) for station in station_list),
             "hourly": variables,
             "start_date": chunk_start.isoformat(),
             "end_date": chunk_end.isoformat(),
             "temperature_unit": "fahrenheit",
-            "timezone": station.timezone,
+            "timezone": "auto",
             "models": model_parameter,
         }
-        payload = _request_json(OPEN_METEO_PREVIOUS_RUNS_URL, params)
-        if not isinstance(payload, dict):
+        cache_key = hashlib.sha256(json.dumps(params, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        cache_path = cache_root / f"batch_{chunk_start}_{chunk_end}_{cache_key[:12]}.json" if cache_root else None
+        if cache_path and cache_path.exists():
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        else:
+            payload = _request_json(
+                OPEN_METEO_PREVIOUS_RUNS_URL,
+                params,
+                minimum_interval_seconds=request_interval_seconds,
+            )
+            if cache_path:
+                temporary = cache_path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+                os.replace(temporary, cache_path)
+        payloads = payload if isinstance(payload, list) else [payload]
+        if len(payloads) != len(station_list) or not all(isinstance(item, dict) for item in payloads):
             raise SourceError("Previous-runs API returned an unexpected multi-location payload.")
-        return _summarize_hourly_forecast(payload, station, lead_days, models)
+        frames = [
+            _summarize_hourly_forecast(location_payload, station, lead_days, models)
+            for station, location_payload in zip(station_list, payloads, strict=True)
+        ]
+        return pd.concat([frame for frame in frames if not frame.empty], ignore_index=True) if any(not frame.empty for frame in frames) else pd.DataFrame()
 
-    jobs = [
-        (station, chunk_start, chunk_end)
-        for chunk_start, chunk_end in _date_range(start, end, chunk_days)
-        for station in stations
-    ]
+    jobs = list(_date_range(start, end, chunk_days))
     # Bounded concurrency makes the multi-year data build practical while
     # respecting a public endpoint. Results remain deterministically sorted
     # below, regardless of response order.
+    completed = 0
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(fetch_one, *job) for job in jobs]
         for future in as_completed(futures):
             summarized = future.result()
             if not summarized.empty:
                 all_frames.append(summarized)
+            completed += 1
+            print(f"Archived forecast chunks: {completed}/{len(jobs)}", flush=True)
     if not all_frames:
         raise SourceError("Historical forecast source returned no usable forecast features.")
     result = pd.concat(all_frames, ignore_index=True)
@@ -261,6 +333,34 @@ def add_derived_forecast_features(frame: pd.DataFrame) -> pd.DataFrame:
     observation, analysis, or future-outcome data.
     """
     result = frame.copy()
+    # The raw hourly summaries are intentionally retained; these additions
+    # expose physically meaningful relationships that a shallow residual
+    # learner otherwise has to rediscover from sparse station-level history.
+    # Every term below is calculated only from the archived/live forecast
+    # fields available at issuance time.
+    for model in MODEL_SOURCES:
+        prefix = f"{model}__"
+        tmax = f"{prefix}tmax_f"
+        tmin = f"{prefix}tmin_f"
+        tmean = f"{prefix}temp_mean_f"
+        dewpoint = f"{prefix}dew_point_2m_mean"
+        cloud = f"{prefix}cloud_cover_mean"
+        humidity = f"{prefix}relative_humidity_2m_mean"
+        wind_speed = f"{prefix}wind_speed_10m_mean"
+        wind_sin = f"{prefix}wind_direction_10m_sin_mean"
+        wind_cos = f"{prefix}wind_direction_10m_cos_mean"
+        if {tmax, tmin}.issubset(result):
+            result[f"{prefix}diurnal_range_f"] = result[tmax] - result[tmin]
+        if {tmax, tmean}.issubset(result):
+            result[f"{prefix}peak_above_mean_f"] = result[tmax] - result[tmean]
+        if {tmean, dewpoint}.issubset(result):
+            result[f"{prefix}dewpoint_depression_f"] = result[tmean] - result[dewpoint]
+        if {cloud, humidity}.issubset(result):
+            result[f"{prefix}cloud_humidity"] = result[cloud] * result[humidity] / 100
+        if {wind_speed, wind_sin}.issubset(result):
+            result[f"{prefix}wind_u_mean"] = result[wind_speed] * result[wind_sin]
+        if {wind_speed, wind_cos}.issubset(result):
+            result[f"{prefix}wind_v_mean"] = result[wind_speed] * result[wind_cos]
     for suffix in ("tmax_f", "tmin_f", "temp_mean_f"):
         columns = [f"{model}__{suffix}" for model in MODEL_SOURCES if f"{model}__{suffix}" in result]
         if len(columns) > 1:
@@ -272,6 +372,11 @@ def add_derived_forecast_features(frame: pd.DataFrame) -> pd.DataFrame:
             if baseline in result and other in result:
                 short_name = model.removeprefix("ncep_").removesuffix("_conus").removesuffix("_seamless")
                 result[f"model_agreement__nbm_minus_{short_name}__{suffix}"] = result[baseline] - result[other]
+        if suffix == "tmax_f" and len(columns) == len(MODEL_SOURCES):
+            nbm, hrrr, gfs = columns
+            result["model_agreement__weighted_consensus_tmax_f"] = .5 * result[nbm] + .25 * result[hrrr] + .25 * result[gfs]
+            result["model_agreement__hrrr_minus_gfs__tmax_f"] = result[hrrr] - result[gfs]
+            result["model_agreement__nbm_position_tmax_f"] = result[nbm] - result[columns].mean(axis=1)
     for model in MODEL_SOURCES:
         early = [f"{model}__temp_{hour:02d}_f" for hour in (0, 3, 6, 9) if f"{model}__temp_{hour:02d}_f" in result]
         late = [f"{model}__temp_{hour:02d}_f" for hour in (12, 15, 18, 21) if f"{model}__temp_{hour:02d}_f" in result]
@@ -281,6 +386,7 @@ def add_derived_forecast_features(frame: pd.DataFrame) -> pd.DataFrame:
             result[f"{model}__morning_mean_f"] = morning
             result[f"{model}__afternoon_mean_f"] = afternoon
             result[f"{model}__warming_f"] = afternoon - morning
+    result["feature_schema_version"] = "v003_20station_regime_features"
     return result
 
 
@@ -289,17 +395,30 @@ def build_training_table(
     end: date,
     lead_days: int = 1,
     stations: Iterable[Station] | None = None,
+    chunk_days: int = 31,
+    max_workers: int = 2,
+    request_interval_seconds: float = 0.8,
+    cache_dir: str | Path | None = "data/raw/open_meteo_previous_runs",
 ) -> pd.DataFrame:
     """Build a joined, audit-friendly TMAX table with no label fabrication."""
     station_list = list(stations or STATIONS.values())
     labels = fetch_ncei_daily_tmax(station_list, start, end)
-    forecasts = fetch_archived_forecast_features(station_list, start, end, lead_days=lead_days)
+    forecasts = fetch_archived_forecast_features(
+        station_list,
+        start,
+        end,
+        lead_days=lead_days,
+        chunk_days=chunk_days,
+        max_workers=max_workers,
+        request_interval_seconds=request_interval_seconds,
+        cache_dir=cache_dir,
+    )
     table = labels.merge(forecasts, on=["station", "target_date"], how="inner", validate="one_to_one")
     table = add_derived_forecast_features(_add_calendar_features(table))
     # The archived NBM hourly profile is the unmodified physical/NWP baseline.
     table["nbm_baseline_f"] = table["ncep_nbm_conus__tmax_f"]
     table["issue_time_contract"] = f"fixed {lead_days * 24}h archived lead"
-    table["feature_schema_version"] = "v002_archived_nbm_hrrr_gfs_shape_agreement"
+    table["feature_schema_version"] = "v003_20station_regime_features"
     table["label_schema_version"] = "v001_ncei_daily_summaries_tmax"
     table["source_vintage"] = "Open-Meteo Previous Runs fixed-lead archive"
     table["training_table_sha256"] = ""
@@ -369,7 +488,7 @@ def fetch_live_forecast_features(station: Station, target_date: date) -> dict[st
     row["forecast_lead_days"] = max((target_date - local_today).days, 0)
     row["forecast_lead_hours"] = row["forecast_lead_days"] * 24
     row["issue_time_contract"] = "current latest forecast; generated at request time"
-    row["feature_schema_version"] = "v002_archived_nbm_hrrr_gfs_shape_agreement"
+    row["feature_schema_version"] = "v003_20station_regime_features"
     return row
 
 

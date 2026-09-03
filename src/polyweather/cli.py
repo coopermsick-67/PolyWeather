@@ -47,7 +47,15 @@ def _requested_stations(requested: list[str], model_path: str | Path) -> list[st
 
 
 def command_build_data(args: argparse.Namespace) -> None:
-    table = build_training_table(args.start, args.end, lead_days=args.lead_days)
+    table = build_training_table(
+        args.start,
+        args.end,
+        lead_days=args.lead_days,
+        chunk_days=args.chunk_days,
+        max_workers=args.max_workers,
+        request_interval_seconds=args.request_interval_seconds,
+        cache_dir=args.cache_dir,
+    )
     output = write_training_table(table, args.output)
     print(json.dumps({"output": str(output), "rows": len(table), "stations": sorted(table.station.unique())}, indent=2))
 
@@ -94,7 +102,7 @@ def command_train(args: argparse.Namespace) -> None:
         "model_family": f"{args.kind.upper()} residual MOS",
         "target": "NCEI daily-summaries TMAX (°F)",
         "base_forecast": "NCEP NBM hourly profile maximum (°F)",
-        "feature_schema_version": "v002_archived_nbm_hrrr_gfs_shape_agreement",
+        "feature_schema_version": "v003_20station_regime_features",
         "training_rows": model.train_rows,
         "training_start": str(table.target_date.min()),
         "model_fit_end": str(model_fit_end),
@@ -171,7 +179,7 @@ def command_log_current(args: argparse.Namespace) -> None:
         record.update(
             {
                 "model_artifact_sha256": model_hash,
-                "feature_schema_version": "v002_archived_nbm_hrrr_gfs_shape_agreement",
+                "feature_schema_version": "v003_20station_regime_features",
                 "model_train_rows": model.train_rows,
                 "model_calibration_rows": model.calibration_rows,
             }
@@ -195,6 +203,10 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--start", type=_date, required=True)
     build.add_argument("--end", type=_date, required=True)
     build.add_argument("--lead-days", type=int, default=1, choices=(1, 2, 3))
+    build.add_argument("--chunk-days", type=int, default=31, help="Historical days per source request; smaller values are safer for public APIs.")
+    build.add_argument("--max-workers", type=int, default=2, help="Bounded concurrent source requests.")
+    build.add_argument("--request-interval-seconds", type=float, default=0.8, help="Process-wide delay between archived-source requests.")
+    build.add_argument("--cache-dir", default="data/raw/open_meteo_previous_runs", help="Persistent raw-response cache; reruns resume without refetching completed chunks.")
     build.add_argument("--output", default="data/features/tmax_training.parquet")
     build.set_defaults(func=command_build_data)
 

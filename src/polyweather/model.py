@@ -175,14 +175,20 @@ class ResidualForecaster:
                     raise RuntimeError("xgboost is required for the xgb residual model.")
                 estimator = XGBRegressor(
                     objective="reg:absoluteerror",
-                    n_estimators=450,
-                    learning_rate=0.035,
-                    max_depth=3,
-                    min_child_weight=10,
-                    subsample=0.85,
-                    colsample_bytree=0.80,
-                    reg_lambda=5.0,
-                    reg_alpha=0.05,
+                    # More data now spans all 20 settlement stations. A
+                    # slightly deeper but more strongly regularized model can
+                    # represent station-by-regime interactions (coastal cloud
+                    # layers, dry heat, frontal days) without chasing a small
+                    # station's noise. Parameters are assessed only in the
+                    # later rolling-origin run, never on fitted rows.
+                    n_estimators=650,
+                    learning_rate=0.025,
+                    max_depth=4,
+                    min_child_weight=14,
+                    subsample=0.82,
+                    colsample_bytree=0.74,
+                    reg_lambda=8.0,
+                    reg_alpha=0.10,
                     random_state=random_state,
                     n_jobs=-1,
                     tree_method="hist",
