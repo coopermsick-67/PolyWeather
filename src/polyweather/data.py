@@ -54,6 +54,24 @@ class SourceError(RuntimeError):
     """Raised when an upstream weather source cannot provide required data."""
 
 
+def has_complete_core_guidance(features: dict[str, object]) -> bool:
+    """Return whether every model required by the residual MOS supplied Tmax.
+
+    The fitted residual model was evaluated with NBM, HRRR, and GFS together.
+    Scikit-learn can impute a missing source, but doing that live would silently
+    change the deployed forecast contract.  Callers must therefore use the
+    residual correction only when this small, non-imputed core is present.
+    """
+    for model in MODEL_SOURCES:
+        value = features.get(f"{model}__tmax_f")
+        try:
+            if not np.isfinite(float(value)):
+                return False
+        except (TypeError, ValueError):
+            return False
+    return True
+
+
 class _RequestPacer:
     """Process-wide pacing for public weather endpoints.
 
@@ -449,7 +467,7 @@ def write_training_table(table: pd.DataFrame, path: str | Path) -> Path:
     return target
 
 
-def fetch_live_forecast_features(station: Station, target_date: date) -> dict[str, float | str]:
+def fetch_live_forecast_features(station: Station, target_date: date) -> dict[str, object]:
     """Fetch the current NBM/HRRR/GFS forecast curve for one local target date.
 
     Live source data are only for inference. They are never mixed into the
@@ -489,6 +507,15 @@ def fetch_live_forecast_features(station: Station, target_date: date) -> dict[st
     row["forecast_lead_hours"] = row["forecast_lead_days"] * 24
     row["issue_time_contract"] = "current latest forecast; generated at request time"
     row["feature_schema_version"] = "v003_20station_regime_features"
+    # Open-Meteo's standard endpoint does not expose a stable individual-run
+    # identifier. Preserve the facts it *does* provide so an immutable shadow
+    # record can distinguish source retrieval time from forecast target time.
+    row["source_provider"] = "Open-Meteo Forecast API"
+    row["source_fetched_at_utc"] = datetime.now(timezone.utc).isoformat()
+    row["source_generationtime_ms"] = payload.get("generationtime_ms")
+    row["source_timezone"] = str(payload.get("timezone") or station.timezone)
+    row["source_utc_offset_seconds"] = payload.get("utc_offset_seconds")
+    row["guidance_complete"] = has_complete_core_guidance(row)
     return row
 
 

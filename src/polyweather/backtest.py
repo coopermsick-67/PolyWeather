@@ -5,12 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
 from .metrics import forecast_metrics, interval_metrics, relative_mae_skill
 from .model import BASELINE_COLUMN, TARGET_COLUMN, BlendedResidualForecaster, ResidualForecaster, SeasonalClimatology
+from .stations import STATIONS
 
 
 @dataclass
@@ -82,7 +84,11 @@ def _bootstrap_metrics(
     )
 
 
-def _acceptance(predictions: pd.DataFrame, by_station: pd.DataFrame) -> dict[str, object]:
+def _acceptance(
+    predictions: pd.DataFrame,
+    by_station: pd.DataFrame,
+    expected_stations: Iterable[str] | None = None,
+) -> dict[str, object]:
     # A challenger is retained only when its untouched-fold MAE actually
     # improves on XGBoost. This prevents benchmark-only complexity from being
     # silently promoted just because it clears a weaker baseline gate.
@@ -95,11 +101,18 @@ def _acceptance(predictions: pd.DataFrame, by_station: pd.DataFrame) -> dict[str
     champion_column = "blend_prediction_f" if champion_label == "Station blend residual" else "xgb_prediction_f"
     champion = overall_blend if champion_label == "Station blend residual" else overall_xgb
     total = by_station.loc[by_station["model"] == champion_label].copy()
-    station_wins = total.loc[total["mae_skill_vs_nbm"] > 0, "station"].nunique()
+    expected = {str(station).upper() for station in (expected_stations if expected_stations is not None else STATIONS)}
+    evaluated = {str(station).upper() for station in total["station"].unique()}
+    missing_stations = sorted(expected - evaluated)
+    station_wins = total.loc[
+        total["station"].astype(str).str.upper().isin(expected) & (total["mae_skill_vs_nbm"] > 0), "station"
+    ].nunique()
     margin = 0.01
     condition_nbm = bool(champion["mae_skill_vs_nbm"] >= margin)
     condition_ridge = bool(champion["mae_f"] < overall_ridge["mae_f"])
-    condition_stations = bool(station_wins >= 4)
+    # A 20-city release cannot pass because a small subset performed well.
+    # Every configured station must be evaluated and beat raw NBM.
+    condition_stations = bool(not missing_stations and station_wins >= len(expected))
     statistical_candidate = bool(condition_nbm and condition_ridge and condition_stations)
     return {
         # Statistical skill is necessary but not sufficient. The project's
@@ -119,7 +132,10 @@ def _acceptance(predictions: pd.DataFrame, by_station: pd.DataFrame) -> dict[str
         "candidate_mae_skill_vs_nbm": champion["mae_skill_vs_nbm"],
         "ridge_mae_f": overall_ridge["mae_f"],
         "station_wins_vs_nbm": int(station_wins),
-        "required_station_wins": 4,
+        "required_station_wins": len(expected),
+        "expected_stations": sorted(expected),
+        "evaluated_stations": sorted(evaluated),
+        "missing_expected_stations": missing_stations,
         "reason": (
             "The XGBoost candidate cleared the rolling-backtest comparison gates, but remains shadow-only "
             "until forecasts are prospectively logged from one frozen issue-time contract and re-verified."
@@ -137,6 +153,7 @@ def run_rolling_backtest(
     test_window_days: int = 31,
     calibration_days: int = 60,
     training_window_days: int | None = None,
+    expected_stations: Iterable[str] | None = None,
 ) -> BacktestResult:
     """Evaluate models using expanding, calendar-ordered folds only."""
     data = table.copy()
@@ -209,7 +226,7 @@ def run_rolling_backtest(
         by_station=by_station,
         by_month=by_month,
         bootstrap=bootstrap,
-        acceptance=_acceptance(result, by_station),
+        acceptance=_acceptance(result, by_station, expected_stations=expected_stations),
     )
 
 

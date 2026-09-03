@@ -20,19 +20,19 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from .data import fetch_live_forecast_features, fetch_live_station_snapshot
+from .data import MODEL_SOURCES, fetch_live_forecast_features, fetch_live_station_snapshot, has_complete_core_guidance
 from .markets import QualityStatus, quality_gate
 from .model import AdaptiveResidualForecaster, BlendedResidualForecaster, ResidualForecaster
 from .stations import STATIONS, station_metadata
 
 
 ROOT = Path(__file__).resolve().parents[2]
-MODEL_PATH = ROOT / "artifacts" / "production_v2" / "xgb_residual_tmax.joblib"
-ADAPTIVE_MODEL_PATH = ROOT / "artifacts" / "production" / "adaptive_residual_tmax.joblib"
-FALLBACK_MODEL_PATH = ROOT / "artifacts" / "production" / "xgb_residual_tmax.joblib"
-PREDICTIONS_PATH = ROOT / "artifacts" / "backtest_v2" / "rolling_predictions.parquet"
-STATION_METRICS_PATH = ROOT / "artifacts" / "backtest_v2" / "station_metrics.csv"
-OVERALL_METRICS_PATH = ROOT / "artifacts" / "backtest_v2" / "overall_metrics.csv"
+# The local/Render adapter must use the same v3 artifact family as the Sites
+# worker. It must not silently fall back to the old five-station v2 bundle.
+MODEL_PATH = ROOT / "artifacts" / "production_v3" / "xgb_residual_tmax.joblib"
+PREDICTIONS_PATH = ROOT / "artifacts" / "backtest_20_enhanced" / "rolling_predictions.parquet"
+STATION_METRICS_PATH = ROOT / "artifacts" / "backtest_20_enhanced" / "station_metrics.csv"
+OVERALL_METRICS_PATH = ROOT / "artifacts" / "backtest_20_enhanced" / "overall_metrics.csv"
 DASHBOARD_TIMEZONE = ZoneInfo("America/New_York")
 STABILITY_STATE_PATH = ROOT / "data" / "normalized" / "dashboard_forecast_state.json"
 MIN_STABLE_CHANGE_F = 2
@@ -48,11 +48,27 @@ def dashboard_today() -> date:
     return datetime.now(DASHBOARD_TIMEZONE).date()
 
 
+def _earliest_station_local_today() -> date:
+    """The earliest "today" across every configured station's own timezone.
+
+    A West Coast station's local calendar day has not yet rolled over for
+    up to ~3 hours after America/New_York already has (e.g. 9:00-11:59 PM
+    Pacific is already after midnight Eastern). Anchoring date validation
+    to America/New_York alone would reject a still-current Pacific "today"
+    during that window. Every configured station is within the continental
+    US, so no station's local today can be more than one day behind or
+    ahead of any other's.
+    """
+    now = datetime.now(timezone.utc)
+    return min(now.astimezone(station.tzinfo).date() for station in STATIONS.values())
+
+
 def validate_dashboard_date(target_date: date) -> None:
-    today = dashboard_today()
-    if not today <= target_date <= today + timedelta(days=7):
+    earliest_today = _earliest_station_local_today()
+    latest_today = dashboard_today()
+    if not earliest_today <= target_date <= latest_today + timedelta(days=7):
         raise ValueError(
-            f"Choose a date from {today.isoformat()} through {(today + timedelta(days=7)).isoformat()}."
+            f"Choose a date from {earliest_today.isoformat()} through {(latest_today + timedelta(days=7)).isoformat()}."
         )
 
 
@@ -249,9 +265,23 @@ def _model_stations(model_path: Path) -> list[Any]:
         return []
 
 
+def _select_model_path() -> Path:
+    """Return the declared v3 artifact and fail closed when it is absent.
+
+    Serving a plausible number from an old model with different station
+    coverage is more dangerous than surfacing an operational error.
+    """
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Required v3 20-station model artifact is missing: {MODEL_PATH}. "
+            "Rebuild production_v3 before serving forecasts."
+        )
+    return MODEL_PATH
+
+
 def payload(target_date: date) -> dict:
     validate_dashboard_date(target_date)
-    model_path = MODEL_PATH if MODEL_PATH.exists() else ADAPTIVE_MODEL_PATH if ADAPTIVE_MODEL_PATH.exists() else FALLBACK_MODEL_PATH
+    model_path = _select_model_path()
     # joblib.load runs pickle deserialization, which can execute arbitrary
     # code for a crafted file. Safe only because model_path is fixed to
     # artifacts/ committed by this repo's own training pipeline, never a
@@ -261,6 +291,12 @@ def payload(target_date: date) -> dict:
     model_version = hashlib.sha256(model_path.read_bytes()).hexdigest()[:16]
     model_stations = _model_stations(model_path)
     trained_station_ids = {station.icao for station in model_stations}
+    missing_trained_stations = sorted(set(STATIONS) - trained_station_ids)
+    if missing_trained_stations:
+        logging.getLogger(__name__).error(
+            "Production model manifest does not cover all configured stations; missing: %s",
+            ", ".join(missing_trained_stations),
+        )
     # The UI needs every configured market.  Untrained stations deliberately
     # receive a live numerical baseline and a NO BET status rather than being
     # hidden or assigned an unvalidated residual-model correction.
@@ -305,7 +341,11 @@ def _build_forecasts(
     for station, features, observation in live_inputs:
         icao = station.icao
         baseline_high = float(features.get("nbm_baseline_f", np.nan))
-        is_calibrated = icao in trained_station_ids
+        complete_guidance = has_complete_core_guidance(features)
+        # The deployed residual correction was evaluated with all three
+        # guidance sources. Do not let the estimator's missing-value imputer
+        # turn a partial upstream response into a supposedly calibrated pick.
+        is_calibrated = icao in trained_station_ids and complete_guidance
         prediction = model.predict(pd.DataFrame([features])).iloc[0] if is_calibrated else None
         predicted_high = float(prediction["prediction_f"]) if prediction is not None else baseline_high
         if not np.isfinite(predicted_high) or not np.isfinite(baseline_high):
@@ -335,11 +375,15 @@ def _build_forecasts(
         disagreement_f = float(features.get("model_agreement__tmax_f_spread", np.nan))
         source_agreement = max(0.0, min(1.0, 1.0 - disagreement_f / 8.0)) if np.isfinite(disagreement_f) else 0.0
         freshness = 0.0 if observation and observation.get("stale") else 1.0
+        # A station registry is not a market-contract registry. Until the
+        # exact provider contract, settlement source, bucket rule, and target
+        # date have been reviewed, weather output may be displayed but it is
+        # never an actionable market pick.
         status = quality_gate(
-            station_known=True, rules_available=False, freshness=freshness, agreement=source_agreement,
-            interval_width_f=2 * half_width,
+            station_known=True, rules_available=False, freshness=freshness,
+            agreement=source_agreement, interval_width_f=2 * half_width,
         )
-        if not is_calibrated:
+        if status is QualityStatus.UNKNOWN_SETTLEMENT_RULE or not is_calibrated or not complete_guidance:
             status = QualityStatus.NO_BET
         forecasts.append(
             {
@@ -351,6 +395,16 @@ def _build_forecasts(
                 "timezone": station.timezone,
                 "marketType": "daily_high",
                 "isCalibrated": is_calibrated,
+                "guidanceComplete": complete_guidance,
+                "requiredGuidanceModels": list(MODEL_SOURCES),
+                "sourceProvenance": {
+                    "provider": features.get("source_provider"),
+                    "fetchedAt": features.get("source_fetched_at_utc"),
+                    "generationtimeMs": features.get("source_generationtime_ms"),
+                    "timezone": features.get("source_timezone"),
+                    "runId": None,
+                    "runIdNote": "The standard source endpoint does not expose a stable forecast-run ID.",
+                },
                 "settlementSource": "NOAA/NCEI Daily Summaries TMAX (final); NWS observations are preliminary",
                 "dataQualityStatus": status.value,
                 "currentObservedTemperatureF": round(float(current_temperature), 1) if current_temperature is not None else None,
@@ -381,6 +435,8 @@ def _build_forecasts(
                     "Current station observation is below the model estimate." if current_temperature is not None and current_temperature < predicted_high else None,
                     "Observed high has been incorporated as a floor." if observed_high is not None else None,
                     "Live NBM baseline shown; station-specific residual calibration is not yet available." if not is_calibrated else None,
+                    "NO BET: complete NBM, HRRR, and GFS guidance is required for the evaluated residual-MOS contract." if not complete_guidance else None,
+                    "NO BET: no provider-specific market settlement contract has been verified for this display." ,
                 ))),
                 "stabilityReason": stability_reason,
             }
@@ -404,7 +460,7 @@ def _assemble_payload(target_date: date, forecasts: list[dict[str, Any]], model_
         "modelEvidence": _model_evidence(),
         "forecastInputs": "NCEP NBM + HRRR + GFS forecast guidance",
         "validationTarget": "Official NOAA/NCEI daily TMAX",
-        "evaluationContract": "2,459 held-out station-day forecasts; archived 24-hour lead composite",
+        "evaluationContract": "9,839 held-out station-day forecasts across all 20 configured stations; archived 24-hour lead composite",
         "releaseStatus": "Experimental shadow monitoring — not operational guidance",
         "modelVersion": model_version,
         "stabilityPolicy": "Minor refresh changes under 2°F are held; observed highs can update today.",

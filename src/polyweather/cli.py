@@ -173,8 +173,13 @@ def command_log_current(args: argparse.Namespace) -> None:
     model = joblib.load(args.model)
     target_date = args.target_date or (date.today() + timedelta(days=1))
     requested = _requested_stations(args.stations, args.model)
-    records = create_shadow_records(model, [require_station(icao) for icao in requested], target_date)
     model_hash = hashlib.sha256(Path(args.model).read_bytes()).hexdigest()
+    records = create_shadow_records(
+        model,
+        [require_station(icao) for icao in requested],
+        target_date,
+        model_artifact_sha256=model_hash,
+    )
     for record in records:
         record.update(
             {

@@ -10,7 +10,7 @@ from typing import Iterable
 
 import pandas as pd
 
-from .data import fetch_live_forecast_features, fetch_ncei_daily_tmax
+from .data import MODEL_SOURCES, fetch_live_forecast_features, fetch_ncei_daily_tmax, has_complete_core_guidance
 from .metrics import forecast_metrics, interval_metrics
 from .model import ResidualForecaster
 from .stations import Station
@@ -20,8 +20,16 @@ def create_shadow_records(
     model: ResidualForecaster,
     stations: Iterable[Station],
     target_date: date,
+    *,
+    model_artifact_sha256: str | None = None,
+    feature_schema_version: str = "v003_20station_regime_features",
 ) -> list[dict]:
-    """Create self-contained, timestamped forecast records for later scoring."""
+    """Create immutable, fully-provenanced forecasts for later scoring.
+
+    A shadow record is valid only when the live feature contract matches the
+    evaluated residual MOS (NBM + HRRR + GFS).  Missing guidance is not
+    imputed into a supposedly prospective performance record.
+    """
     issued_at = datetime.now(timezone.utc).isoformat()
     records: list[dict] = []
     for station in stations:
@@ -32,6 +40,10 @@ def create_shadow_records(
                 f"({local_today.isoformat()}); received {target_date.isoformat()}."
             )
         features = fetch_live_forecast_features(station, target_date)
+        if not has_complete_core_guidance(features):
+            raise ValueError(
+                f"{station.icao}: refusing shadow snapshot without complete NBM, HRRR, and GFS guidance."
+            )
         output = model.predict(pd.DataFrame([features])).iloc[0].to_dict()
         records.append(
             {
@@ -42,7 +54,17 @@ def create_shadow_records(
                 "issue_time_utc": issued_at,
                 "issue_time_contract": "latest live multi-model forecast at request time",
                 "source_models": ["NCEP NBM CONUS", "NCEP HRRR CONUS", "NCEP GFS Seamless"],
+                "required_source_models": list(MODEL_SOURCES),
+                "guidance_complete": True,
+                "record_schema_version": "v2_prospective_full_guidance",
                 "model_family": f"{model.kind.title()} residual MOS",
+                "model_identity": {
+                    "artifact_sha256": model_artifact_sha256,
+                    "kind": model.kind,
+                    "train_rows": int(model.train_rows),
+                    "calibration_rows": int(model.calibration_rows),
+                    "feature_schema_version": feature_schema_version,
+                },
                 "nbm_baseline_f": float(features["nbm_baseline_f"]),
                 "forecast_f": float(output["prediction_f"]),
                 "p10_f": float(output["p10_f"]),
@@ -50,6 +72,15 @@ def create_shadow_records(
                 "p90_f": float(output["p90_f"]),
                 "calibration_offset_f": float(output["calibration_offset_f"]),
                 "conformal_halfwidth_f": float(output["conformal_halfwidth_f"]),
+                "source_provenance": {
+                    "provider": features.get("source_provider"),
+                    "fetched_at_utc": features.get("source_fetched_at_utc"),
+                    "generationtime_ms": features.get("source_generationtime_ms"),
+                    "timezone": features.get("source_timezone"),
+                    "utc_offset_seconds": features.get("source_utc_offset_seconds"),
+                    "run_id": None,
+                    "run_id_note": "The standard Open-Meteo endpoint does not expose a stable forecast-run ID.",
+                },
                 # The full predictor snapshot prevents a later upstream API
                 # update from silently rewriting what was known at issue time.
                 "feature_snapshot": {
