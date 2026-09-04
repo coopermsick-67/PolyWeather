@@ -29,7 +29,7 @@ function formatStationList(registry, limit = 8) {
 }
 
 function useRoute() {
-  const readRoute = () => ['forecast', 'backtest'].includes(window.location.hash.slice(2)) ? window.location.hash.slice(2) : 'home'
+  const readRoute = () => ['forecast', 'backtest', 'how-it-works', 'accuracy'].includes(window.location.hash.slice(2)) ? window.location.hash.slice(2) : 'home'
   const [route, setRoute] = useState(readRoute)
   useEffect(() => {
     const change = () => setRoute(readRoute())
@@ -65,8 +65,8 @@ function WorkspaceNav({ route, theme, onThemeToggle }) {
     { href: '#/', label: 'Overview', icon: BarChart3, active: route === 'home' },
     { href: '#/forecast', label: 'Forecast board', icon: CloudSun, active: route === 'forecast' },
     { href: '#/backtest', label: 'Research backtest', icon: Database, active: route === 'backtest' },
-    { href: '#/how-it-works', label: 'Methodology', icon: FileText, active: false },
-    { href: '#/accuracy', label: 'Accuracy notes', icon: ShieldCheck, active: false },
+    { href: '#/how-it-works', label: 'Methodology', icon: FileText, active: route === 'how-it-works' },
+    { href: '#/accuracy', label: 'Accuracy notes', icon: ShieldCheck, active: route === 'accuracy' },
   ]
   return <aside className="workspace-nav"><Logo /><p className="workspace-nav-label">Forecast research</p><nav aria-label="Workspace navigation">
     {navItems.map(({ href, label, icon: Icon, active }) => <a key={href} href={href} className={active ? 'active' : ''} aria-current={active ? 'page' : undefined}><Icon size={19} /><span>{label}</span></a>)}
@@ -100,12 +100,17 @@ function AppHeader({ route, selectedDate, today, maxDate, onDateChange, onRefres
   )
 }
 
-function HomePage({ data, loading, error }) {
+function HomePage({ data, loading, error, route }) {
   const [openFaq, setOpenFaq] = useState(null)
   useEffect(() => {
-    const id = window.location.hash === '#/how-it-works' ? 'how-it-works' : window.location.hash === '#/accuracy' ? 'accuracy' : null
+    // HomePage stays mounted across 'home' / 'how-it-works' / 'accuracy' --
+    // they are anchors within this same page, not separate routes -- so this
+    // must re-run on every route change (not just on mount) or clicking
+    // Methodology/Accuracy from an already-open homepage updates the URL and
+    // nav highlight but never actually scrolls anywhere.
+    const id = route === 'how-it-works' || route === 'accuracy' ? route : null
     if (id) window.setTimeout(() => document.getElementById(id)?.scrollIntoView({ block: 'start' }), 0)
-  }, [])
+  }, [route])
   const registry = data?.stationRegistry
   const stationCount = registry?.length
   const stationCopy = stationCount ? `${stationCount} settlement stations` : 'settlement stations across the U.S.'
@@ -319,5 +324,5 @@ export default function App() {
       window.location.assign(session.url)
     } catch (reason) { setBillingError(reason.message || 'Could not open billing management.') } finally { setBillingBusy(false) }
   }
-  return <div className="app app-shell"><a className="skip-link" href="#main-content">Skip to content</a><WorkspaceNav route={route} theme={theme} onThemeToggle={toggleTheme} /><div className="workspace-content"><AppHeader route={route} selectedDate={selectedDate} today={today} maxDate={maxDate} onDateChange={setSelectedDate} onRefresh={forceRefresh} loading={loading} theme={theme} onThemeToggle={toggleTheme} /><div id="main-content">{route === 'forecast' ? <ForecastPage data={data} selectedDate={selectedDate} today={today} maxDate={maxDate} onSelectDate={setSelectedDate} loading={loading} error={error} onRefresh={forceRefresh} selectedStation={selectedStation} onSelectStation={setSelectedStation} stationFilter={stationFilter} onStationFilter={setStationFilter} showBaseline={showBaseline} onShowBaseline={setShowBaseline} onCopy={copySummary} /> : route === 'backtest' ? <BacktestWorkspace registry={data?.stationRegistry ?? []} /> : <HomePage data={data} loading={loading} error={error} />}</div><footer className="site-footer"><div className="page-width"><Logo /><div><a href="#/how-it-works">How it works</a><a href="#/accuracy">Model notes</a><a href="#/forecast">Forecast board</a><a href="#/backtest">Backtest</a></div><p>Experimental research only—not betting, financial, or weather-safety advice.</p></div></footer></div></div>
+  return <div className="app app-shell"><a className="skip-link" href="#main-content">Skip to content</a><WorkspaceNav route={route} theme={theme} onThemeToggle={toggleTheme} /><div className="workspace-content"><AppHeader route={route} selectedDate={selectedDate} today={today} maxDate={maxDate} onDateChange={setSelectedDate} onRefresh={forceRefresh} loading={loading} theme={theme} onThemeToggle={toggleTheme} /><div id="main-content">{route === 'forecast' ? <ForecastPage data={data} selectedDate={selectedDate} today={today} maxDate={maxDate} onSelectDate={setSelectedDate} loading={loading} error={error} onRefresh={forceRefresh} selectedStation={selectedStation} onSelectStation={setSelectedStation} stationFilter={stationFilter} onStationFilter={setStationFilter} showBaseline={showBaseline} onShowBaseline={setShowBaseline} onCopy={copySummary} /> : route === 'backtest' ? <BacktestWorkspace registry={data?.stationRegistry ?? []} /> : <HomePage data={data} loading={loading} error={error} route={route} />}</div><footer className="site-footer"><div className="page-width"><Logo /><div><a href="#/how-it-works">How it works</a><a href="#/accuracy">Model notes</a><a href="#/forecast">Forecast board</a><a href="#/backtest">Backtest</a></div><p>Experimental research only—not betting, financial, or weather-safety advice.</p></div></footer></div></div>
 }

@@ -2,6 +2,7 @@ import { ChevronRight, CloudSun, Sun } from 'lucide-react'
 import RangeBar from './RangeBar'
 
 function Uncertainty({ uncertainty }) {
+  if (uncertainty === 'Unavailable') return <span className="confidence" aria-label="Forecast uncertainty is unavailable"><i className="confidence-bars" aria-hidden="true">{[0, 1, 2, 3].map((bar) => <b key={bar} />)}</i><span>Unavailable</span></span>
   const level = uncertainty === 'Low' ? 4 : 3
   return <span className="confidence" aria-label={`${uncertainty} forecast uncertainty`}><i className="confidence-bars" aria-hidden="true">{[0, 1, 2, 3].map((bar) => <b key={bar} className={bar < level ? 'on' : ''} />)}</i><span>{uncertainty}</span></span>
 }

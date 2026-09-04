@@ -73,6 +73,16 @@ async function fetchWithTimeout(input, init = {}, timeoutMs = FORECAST_API_TIMEO
   }
 }
 
+// Cloudflare Workers limit concurrent outbound responses.  Always consume or
+// cancel an unsuccessful body so a retry cannot leave a response in-flight.
+async function jsonIfOk(response) {
+  if (!response?.ok) {
+    try { await response?.body?.cancel(); } catch { /* Nothing to release. */ }
+    return null;
+  }
+  return response.json().catch(() => null);
+}
+
 async function fetchFlaskDashboard(targetDate, env) {
   const apiUrl = env.FORECAST_API_URL || DEFAULT_FORECAST_API_URL;
   const endpoint = new URL('/api/dashboard', apiUrl);
@@ -98,6 +108,11 @@ function directNbmEndpoint(stations) {
     temperature_unit: 'fahrenheit',
     timezone: 'auto',
     forecast_days: '16',
+    // At UTC midnight, several settlement stations are still on their
+    // previous local calendar day. Asking for one prior day guarantees the
+    // station-local "today" index exists during that handoff instead of
+    // returning an empty board until the next upstream model cycle.
+    past_days: '1',
     models: 'ncep_nbm_conus',
   })) endpoint.searchParams.set(key, value);
   return endpoint;
@@ -151,7 +166,7 @@ async function directNbmDashboard(targetDate) {
   let payload;
   try {
     response = await fetchWithTimeout(directNbmEndpoint(snapshot.stationRegistry), { headers: { Accept: 'application/json' } }, 15_000);
-    if (response.ok) payload = await response.json().catch(() => null);
+    payload = await jsonIfOk(response);
   } catch (error) {
     console.warn('Bulk NBM fetch failed; retrying each station.', error.message || error);
   }
@@ -165,16 +180,22 @@ async function directNbmDashboard(targetDate) {
     return Number.isFinite(Number(daily?.temperature_2m_max?.[index]));
   };
   if (!payload || stations.length !== snapshot.stationRegistry.length || stations.some((item) => !hasRequestedHigh(item))) {
-    stations = await Promise.all(snapshot.stationRegistry.map(async (station, index) => {
-      if (hasRequestedHigh(stations[index])) return stations[index];
+    const missing = snapshot.stationRegistry.map((station, index) => ({ station, index })).filter(({ index }) => !hasRequestedHigh(stations[index]));
+    // A 20-request Promise.all leaves Cloudflare with stalled response bodies
+    // when an upstream model is slow. Repair at most four stations at once;
+    // this preserves the all-city fallback without exhausting worker fetches.
+    for (let offset = 0; offset < missing.length; offset += 4) {
+      const repaired = await Promise.all(missing.slice(offset, offset + 4).map(async ({ station, index }) => {
       const requestFor = async (model) => {
         const endpoint = directNbmEndpoint([station]);
         endpoint.searchParams.set('models', model);
         const point = await fetchWithTimeout(endpoint, { headers: { Accept: 'application/json' } }, 8_000);
-        return point.ok ? point.json() : null;
+        return jsonIfOk(point);
       };
-      try { return await requestFor('ncep_nbm_conus') || await requestFor('best_match'); } catch { return null; }
-    }));
+        try { return { index, item: await requestFor('ncep_nbm_conus') || await requestFor('best_match') }; } catch { return { index, item: null }; }
+      }));
+      for (const { index, item } of repaired) stations[index] = item;
+    }
   }
   const forecasts = snapshot.stationRegistry.map((station, index) => directGuidanceForecast(station, resolvedDate, stations[index])).filter(Boolean);
   if (!forecasts.length) throw new Error('Direct NCEP NBM guidance returned no usable daily highs.');
@@ -194,6 +215,161 @@ async function directNbmDashboard(targetDate) {
   };
 }
 
+const NWS_HEADERS = {
+  Accept: 'application/geo+json',
+  // NWS asks API clients to identify themselves. This stable product name is
+  // also preferable to forwarding a visitor's browser user agent upstream.
+  'User-Agent': 'WeatherPicks live dashboard (weatherpicks.coopdogg67.chatgpt.site)',
+};
+
+function fahrenheit(celsius) {
+  return Number.isFinite(celsius) ? celsius * 9 / 5 + 32 : null;
+}
+
+async function nwsJson(url) {
+  const response = await fetchWithTimeout(url, { headers: NWS_HEADERS }, 10_000);
+  const value = await jsonIfOk(response);
+  if (!value) throw new Error('NWS did not return usable live weather data.');
+  return value;
+}
+
+function dateAtStation(value, station) {
+  return localDate(new Date(value), station.timezone);
+}
+
+async function nwsStationForecast(station, targetDate, today) {
+  const forecastUrl = 'https://api.weather.gov/gridpoints/' + station.forecastGrid.office + '/' + station.forecastGrid.x + ',' + station.forecastGrid.y + '/forecast';
+  const observationUrl = 'https://api.weather.gov/stations/' + station.stationId + '/observations?limit=100';
+  const [forecastPayload, observationsPayload] = await Promise.all([
+    nwsJson(forecastUrl),
+    targetDate === today ? nwsJson(observationUrl).catch(() => null) : Promise.resolve(null),
+  ]);
+  const period = (forecastPayload.properties?.periods ?? []).find((item) =>
+    item.isDaytime && dateAtStation(item.startTime, station) === targetDate && Number.isFinite(Number(item.temperature))
+  );
+  if (!period) return null;
+
+  const observations = (observationsPayload?.features ?? [])
+    .map((feature) => {
+      const properties = feature.properties ?? {};
+      return { time: properties.timestamp, temperatureF: fahrenheit(properties.temperature?.value) };
+    })
+    .filter((item) => item.time && Number.isFinite(item.temperatureF) && dateAtStation(item.time, station) === targetDate)
+    .sort((left, right) => new Date(left.time) - new Date(right.time));
+  const latest = observations.at(-1) ?? null;
+  const observedTemperatures = observations.map((item) => item.temperatureF);
+  const observedHigh = observedTemperatures.length ? Math.max(...observedTemperatures) : null;
+  const observedLow = observedTemperatures.length ? Math.min(...observedTemperatures) : null;
+  const nwsHigh = Math.round(Number(period.temperature));
+  // A live reported station high is factual and must never be overwritten by
+  // a forecast that was issued before that observation arrived.
+  const high = Math.max(nwsHigh, observedHigh == null ? -Infinity : Math.round(observedHigh));
+  const prior = snapshot.forecasts.find((forecast) => forecast.station === station.stationId) ?? {};
+  return {
+    ...prior,
+    station: station.stationId,
+    city: station.name,
+    marketLocation: station.display_name,
+    timezone: station.timezone,
+    targetDate,
+    highF: high,
+    rawModelHighF: nwsHigh,
+    baselineHighF: nwsHigh,
+    modelDeltaF: high - nwsHigh,
+    rangeLowF: high - 3,
+    rangeHighF: high + 3,
+    fourDegreeRangeLowF: high - 2,
+    fourDegreeRangeHighF: high + 2,
+    modelRange: [high - 3, high + 3],
+    uncertainty: 'Unavailable',
+    isCalibrated: false,
+    currentObservedTemperatureF: latest ? Math.round(latest.temperatureF * 10) / 10 : null,
+    observedHighSoFarF: observedHigh == null ? null : Math.round(observedHigh),
+    observedLowSoFarF: observedLow == null ? null : Math.round(observedLow),
+    intradayObservations: observations,
+    lastObservationAt: latest?.time ?? null,
+    dataFreshness: 1,
+    sourceAgreement: null,
+    modelSpreadF: null,
+    sourceName: 'NWS official daily forecast',
+    sourceCount: 1,
+    dataQualityStatus: 'LIVE_NWS_FORECAST',
+    reasonCodes: ['NWS daily forecast: ' + (period.shortForecast || ('high near ' + nwsHigh + '°F')) + '. ' + (latest ? 'Station observations are live.' : 'No station observation has been reported for this selected day yet.')],
+    stabilityReason: observedHigh != null && high > nwsHigh ? 'observed_high' : 'nws_live_forecast',
+  };
+}
+
+async function nwsLiveDashboard(targetDate) {
+  const now = new Date();
+  const today = localDate(now, 'America/New_York');
+  const resolvedDate = targetDateForRequest(targetDate, today, earliestStationLocalToday(now, snapshot.stationRegistry));
+  const forecasts = [];
+  // NWS provides one forecast-grid and, for today, one station-observation
+  // request per market. Keep only four in flight so this stays well within
+  // the Worker's outbound-request budget and remains responsive.
+  for (let offset = 0; offset < snapshot.stationRegistry.length; offset += 4) {
+    const batch = await Promise.all(snapshot.stationRegistry.slice(offset, offset + 4).map(async (station) => {
+      try { return await nwsStationForecast(station, resolvedDate, today); } catch { return null; }
+    }));
+    forecasts.push(...batch.filter(Boolean));
+  }
+  if (!forecasts.length) throw new Error('NWS did not return daily forecasts for any configured station.');
+  const available = new Set(forecasts.map((forecast) => forecast.station));
+  return {
+    ...snapshot,
+    today,
+    targetDate: resolvedDate,
+    maxDate: addDays(today, 7),
+    generatedAt: now.toISOString(),
+    forecasts,
+    unavailableStations: snapshot.stationRegistry.filter((station) => !available.has(station.stationId)).map((station) => station.stationId),
+    marketForecast: true,
+    forecastInputs: 'Live NWS daily forecasts and station observations.',
+    modelStatus: 'LIVE_NWS_FORECAST: official live guidance; no residual calibration is applied.',
+    releaseStatus: 'Live NWS forecast and station observations refresh every 15 minutes.',
+  };
+}
+
+// The browser also has this fallback, but the Worker must provide it itself.
+// A hosted request can fail before the client gets a usable JSON payload (for
+// example when the upstream forecast model is temporarily unavailable from a
+// Cloudflare isolate). Returning a labeled reference board here keeps the
+// dashboard's charts, station cards, and date controls functional instead of
+// replacing the whole page with an API error.
+function packagedSnapshotDashboard(targetDate) {
+  const now = new Date();
+  const today = localDate(now, 'America/New_York');
+  const resolvedDate = targetDateForRequest(targetDate, today, earliestStationLocalToday(now, snapshot.stationRegistry));
+  const forecasts = (snapshot.forecasts ?? []).map((forecast) => ({
+    ...forecast,
+    targetDate: resolvedDate,
+    isCalibrated: false,
+    currentObservedTemperatureF: null,
+    observedHighSoFarF: null,
+    observedLowSoFarF: null,
+    intradayObservations: [],
+    lastObservationAt: null,
+    dataFreshness: null,
+    sourceAgreement: null,
+    dataQualityStatus: 'PACKAGED_SNAPSHOT_FALLBACK',
+    reasonCodes: ['Live forecast guidance is temporarily unavailable. These are packaged reference values retained so the dashboard remains usable.'],
+    stabilityReason: 'packaged_snapshot_fallback',
+  }));
+  return {
+    ...snapshot,
+    today,
+    targetDate: resolvedDate,
+    maxDate: addDays(today, 7),
+    generatedAt: snapshot.generatedAt,
+    forecasts,
+    unavailableStations: [],
+    marketForecast: false,
+    forecastInputs: 'Packaged reference values; live guidance is unavailable.',
+    modelStatus: 'PACKAGED_SNAPSHOT_FALLBACK: these values are not a live forecast.',
+    releaseStatus: 'Live forecast refresh is unavailable. Do not use this fallback for a weather pick.',
+  };
+}
+
 async function liveDashboard(targetDate, env) {
   try {
     const dashboard = await fetchFlaskDashboard(targetDate, env);
@@ -206,7 +382,17 @@ async function liveDashboard(targetDate, env) {
     return { ...dashboard, stationRegistry: registry, unavailableStations, marketForecast: true };
   } catch (error) {
     console.warn('Calibrated forecast API failed; serving labeled direct-guidance fallback.', error.message || error);
-    return directNbmDashboard(targetDate);
+    try {
+      return await nwsLiveDashboard(targetDate);
+    } catch (nwsError) {
+      console.warn('Live NWS fallback failed; trying direct NBM guidance.', nwsError.message || nwsError);
+      try {
+        return await directNbmDashboard(targetDate);
+      } catch (fallbackError) {
+        console.warn('Direct guidance fallback failed; serving packaged reference board.', fallbackError.message || fallbackError);
+        return packagedSnapshotDashboard(targetDate);
+      }
+    }
   }
 }
 
@@ -486,7 +672,13 @@ export default {
     if (url.pathname === '/api/billing/portal' && request.method === 'POST') return createBillingPortal(request, url, env);
     if (url.pathname === '/api/billing/webhook' && request.method === 'POST') return processStripeWebhook(request, env);
     const path = url.pathname;
-    if (path === '/dashboard-snapshot.json') return new Response('Not found', { status: 404 });
+    // The browser uses this non-sensitive, packaged reference only if both
+    // live forecast paths are unavailable. Serving it prevents a total blank
+    // board while the UI clearly labels it as non-live fallback data.
+    if (path === '/dashboard-snapshot.json') {
+      const snapshotAsset = assets[path];
+      return new Response(request.method === 'HEAD' ? null : decode(snapshotAsset.body), { headers: { 'content-type': snapshotAsset.type, 'cache-control': 'no-store' } });
+    }
     const asset = assets[path === '/' ? '/index.html' : path];
     if (!asset) return new Response('Not found', { status: 404 });
     return new Response(request.method === 'HEAD' ? null : decode(asset.body), {
