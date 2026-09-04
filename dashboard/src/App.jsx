@@ -11,6 +11,7 @@ import ForecastPreview from './components/ForecastPreview'
 import ForecastTable from './components/ForecastTable'
 import MarketCard from './components/MarketCard'
 import IntradayChart from './components/IntradayChart'
+import ForecastFanChart from './components/ForecastFanChart'
 import StationInsight from './components/StationInsight'
 import AccuracyPanel from './components/AccuracyPanel'
 import StatusPanel from './components/StatusPanel'
@@ -60,14 +61,16 @@ function Logo() {
 }
 
 function WorkspaceNav({ route, theme, onThemeToggle }) {
-  return <aside className="workspace-nav"><Logo /><nav aria-label="Workspace navigation">
-    <a href="#/" className={route === 'home' ? 'active' : ''}><BarChart3 size={19} /><span>Overview</span></a>
-    <a href="#/forecast" className={route === 'forecast' ? 'active' : ''}><CloudSun size={19} /><span>Forecasts</span></a>
-    <a href="#/backtest" className={route === 'backtest' ? 'active' : ''}><BarChart3 size={19} /><span>Backtest</span></a>
-    <a href="#/backtest"><Database size={19} /><span>Datasets</span></a>
-    <a href="#/forecast"><Bell size={19} /><span>Alerts</span></a>
-    <a href="#/accuracy"><FileText size={19} /><span>Reports</span></a>
-  </nav><div className="workspace-nav-bottom"><button type="button" onClick={onThemeToggle}><Moon size={18} /><span>{theme === 'dark' ? 'Dark theme' : 'Light theme'}</span></button><span className="workspace-account">WP <small>WeatherPicks workspace</small></span></div></aside>
+  const navItems = [
+    { href: '#/', label: 'Overview', icon: BarChart3, active: route === 'home' },
+    { href: '#/forecast', label: 'Forecast board', icon: CloudSun, active: route === 'forecast' },
+    { href: '#/backtest', label: 'Research backtest', icon: Database, active: route === 'backtest' },
+    { href: '#/how-it-works', label: 'Methodology', icon: FileText, active: false },
+    { href: '#/accuracy', label: 'Accuracy notes', icon: ShieldCheck, active: false },
+  ]
+  return <aside className="workspace-nav"><Logo /><p className="workspace-nav-label">Forecast research</p><nav aria-label="Workspace navigation">
+    {navItems.map(({ href, label, icon: Icon, active }) => <a key={href} href={href} className={active ? 'active' : ''} aria-current={active ? 'page' : undefined}><Icon size={19} /><span>{label}</span></a>)}
+  </nav><div className="workspace-nav-bottom"><button type="button" onClick={onThemeToggle} aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}><Moon size={18} /><span>{theme === 'dark' ? 'Dark theme' : 'Light theme'}</span></button><span className="workspace-account"><small>Public forecast workspace</small></span></div></aside>
 }
 
 function AppHeader({ route, selectedDate, today, maxDate, onDateChange, onRefresh, loading, theme, onThemeToggle }) {
@@ -213,11 +216,12 @@ function ForecastPage({ data, selectedDate, today, maxDate, onSelectDate, loadin
       <ForecastControls registry={registry} selectedStation={stationFilter} onSelectStation={onStationFilter} calibratedIds={calibratedIds} showBaseline={showBaseline} onShowBaseline={onShowBaseline} onCopy={onCopy} />
       {!locked && <>
       <MarketCard registry={registry} selectedStation={selectedStation} forecast={selectedForecast} onSelectStation={onSelectStation} calibratedIds={calibratedIds} />
+      <ForecastFanChart forecast={selectedForecast} />
       <IntradayChart forecast={selectedForecast} />
       {error && <div className="alert" role="status"><strong>Live refresh could not finish.</strong><span>The last successful values remain visible. Try refreshing again in a moment.</span></div>}
       <ForecastTable forecasts={visibleForecasts} loading={loading} showBaseline={showBaseline} selectedStation={selectedStation} onSelectStation={onSelectStation} />
       <section className="performance-card" aria-labelledby="performance-title"><div className="card-title"><div><p className="section-label">MONITORED PERFORMANCE</p><h2 id="performance-title">Recent model performance</h2><p>Rolling mean absolute error compared with the raw NBM guidance.</p></div><a className="text-link" href="#/accuracy">About monitoring <ArrowRight size={15} /></a></div><TrendChart trend={data?.trend} loading={loading} /></section>
-      <AccuracyPanel accuracy={accuracy} evidence={data?.modelEvidence} onSelectStation={onSelectStation} />
+      <AccuracyPanel accuracy={accuracy} evidence={data?.modelEvidence} onSelectStation={onSelectStation} selectedStation={selectedStation} />
       </>}
     </section>
     {!locked && <aside className="forecast-side"><StationInsight forecast={selectedForecast} accuracy={selectedAccuracy} evidence={data?.modelEvidence} rankedCount={accuracy.length} /><ForecastBrief evidence={data?.modelEvidence} /><StatusPanel data={data} loading={loading} /></aside>}

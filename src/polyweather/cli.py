@@ -16,6 +16,7 @@ from .data import add_derived_forecast_features, build_training_table, fetch_liv
 from .model import CONFORMAL_NOMINAL_COVERAGE, AdaptiveResidualForecaster, BlendedResidualForecaster, ResidualForecaster
 from .quality import write_quality_report
 from .reporting import build_backtest_charts, make_model_card
+from .settlement import illustrative_report_by_station
 from .shadow import append_jsonl, create_shadow_records, verify_shadow_log
 from .stations import STATIONS, require_station
 
@@ -193,6 +194,26 @@ def command_log_current(args: argparse.Namespace) -> None:
     print(json.dumps({"log": str(output), "records": records}, indent=2))
 
 
+def command_illustrative_bucket_hit_rate(args: argparse.Namespace) -> None:
+    """Research-only: illustrative/UNVERIFIED bucket-hit-rate + calibration report.
+
+    This scores against `EXAMPLE_BUCKET_WIDTHS` (or a caller-supplied bucket
+    width) because no real, verified `MarketContract` is populated in this
+    repo yet -- every field in the report is prefixed `illustrative_` and it
+    must never be read as a real, contract-backed hit rate. It does not
+    touch, and is not read by, the live dashboard's NO_BET/dataQualityStatus
+    gate in `dashboard_payload.py`.
+    """
+    predictions = pd.read_parquet(args.predictions)
+    report = illustrative_report_by_station(predictions)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "illustrative_bucket_hit_rate.json"
+    output_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
+    print(json.dumps(report, indent=2, default=str))
+    print(f"Wrote illustrative (UNVERIFIED) bucket-hit-rate report to {output_path}")
+
+
 def command_verify_shadow(args: argparse.Namespace) -> None:
     verified, metrics = verify_shadow_log(args.log)
     if not verified.empty:
@@ -260,6 +281,14 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--log", default="data/normalized/shadow_forecasts.jsonl")
     verify.add_argument("--output", default="artifacts/shadow/verified_forecasts.parquet")
     verify.set_defaults(func=command_verify_shadow)
+
+    illustrative_hit_rate = subparsers.add_parser(
+        "illustrative-bucket-hit-rate",
+        help="Research-only: illustrative/UNVERIFIED bucket-hit-rate + calibration report (no real settlement contract).",
+    )
+    illustrative_hit_rate.add_argument("--predictions", default="artifacts/backtest_20_enhanced/rolling_predictions.parquet")
+    illustrative_hit_rate.add_argument("--output-dir", default="artifacts/settlement")
+    illustrative_hit_rate.set_defaults(func=command_illustrative_bucket_hit_rate)
     return parser
 
 

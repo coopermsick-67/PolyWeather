@@ -159,8 +159,14 @@ async function directNbmDashboard(targetDate) {
   // Retry independent station requests, and only then use best_match as a
   // clearly labeled availability fallback. One city must not blank all 20.
   let stations = Array.isArray(payload) ? payload : [payload];
-  if (!payload || stations.length !== snapshot.stationRegistry.length) {
-    stations = await Promise.all(snapshot.stationRegistry.map(async (station) => {
+  const hasRequestedHigh = (item) => {
+    const daily = item?.daily;
+    const index = Array.isArray(daily?.time) ? daily.time.indexOf(resolvedDate) : -1;
+    return Number.isFinite(Number(daily?.temperature_2m_max?.[index]));
+  };
+  if (!payload || stations.length !== snapshot.stationRegistry.length || stations.some((item) => !hasRequestedHigh(item))) {
+    stations = await Promise.all(snapshot.stationRegistry.map(async (station, index) => {
+      if (hasRequestedHigh(stations[index])) return stations[index];
       const requestFor = async (model) => {
         const endpoint = directNbmEndpoint([station]);
         endpoint.searchParams.set('models', model);

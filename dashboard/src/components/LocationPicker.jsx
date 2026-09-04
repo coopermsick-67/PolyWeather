@@ -77,7 +77,7 @@ export default function LocationPicker({ stations, value, onChange, allowAll = f
       <div className="location-picker-search"><Search size={14} aria-hidden="true" /><input ref={inputRef} type="text" placeholder="Search city or station code" value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={onKeyDown} role="combobox" aria-expanded="true" aria-controls="location-picker-listbox" aria-activedescendant={activeIndex >= 0 ? `location-picker-option-${activeIndex}` : undefined} /></div>
       <div className="location-picker-list">
         {allowAll && <button id="location-picker-option-0" type="button" role="option" aria-selected={value == null} className={[value == null && 'selected', activeIndex === 0 && 'is-active'].filter(Boolean).join(' ')} onClick={() => select(null)}><span className="location-picker-name">{allLabel}</span></button>}
-        {filtered.length === 0 && <p className="location-picker-empty">No locations match “{query}”.</p>}
+        {filtered.length === 0 && <p className="location-picker-empty">{stations.length === 0 ? 'Loading locations…' : `No locations match "${query}".`}</p>}
         {filtered.map((station, index) => {
           const calibrated = calibratedIds?.has(station.stationId)
           const optionIndex = allowAll ? index + 1 : index

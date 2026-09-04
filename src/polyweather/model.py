@@ -18,18 +18,53 @@ try:  # xgboost is installed by the project dependency contract.
 except ImportError:  # pragma: no cover - helpful error on an incomplete install.
     XGBRegressor = None  # type: ignore[assignment,misc]
 
+try:  # scipy ships transitively via scikit-learn; declared explicitly below too.
+    from scipy.stats import wilcoxon
+except ImportError:  # pragma: no cover - helpful error on an incomplete install.
+    wilcoxon = None  # type: ignore[assignment,misc]
+
 
 TARGET_COLUMN = "tmax_f"
 BASELINE_COLUMN = "nbm_baseline_f"
 CATEGORICAL_COLUMNS = ("station",)
-# Quantile of trailing-calibration absolute residuals used as the conformal
-# half-width. 0.75 is a real, data-verified quantile (not an arbitrary
-# shrink): on the 2025-04-06..2026-08-10 backtest it produces a mean
-# interval width of ~5.05°F with ~75% empirical coverage, versus the
-# previous 0.90 quantile's ~7.09°F width at ~86.5% coverage. Narrower AND
-# still honestly calibrated to its own stated nominal coverage.
+# Starting quantile of trailing-calibration absolute residuals used as the
+# conformal half-width, and the nominal coverage the manifest advertises.
+# 0.75 was originally hand-picked by eyeballing empirical coverage on the OLD
+# 5-station, 2025-04-06..2026-08-10 backtest (~75% realized). That approach
+# is itself the bug: a constant tuned to match one backtest's *test-fold*
+# outcome does not generalize when the station roster or regime mix changes
+# -- and indeed, on the current 20-station backtest it now realizes only
+# ~71.3% empirical coverage (every one of the 20 stations undercovers; see
+# artifacts/backtest_20_enhanced/station_metrics.csv), a systematic drift,
+# not test-fold noise. Rather than re-picking a new fixed constant against
+# that same backtest (which would just repeat the mistake), `fit()` below
+# self-corrects the quantile level at fit time using a nested split of the
+# calibration block alone -- see `_select_conformal_quantile_level`. This
+# constant is now only the search floor / fallback, never the final level.
 CONFORMAL_QUANTILE = 0.75
+CONFORMAL_QUANTILE_MAX = 0.95
 CONFORMAL_NOMINAL_COVERAGE = CONFORMAL_QUANTILE
+# AdaptiveResidualForecaster station-model selection: a station only switches
+# away from XGB (the default) when its calibration window has at least this
+# many paired rows AND a paired one-sided Wilcoxon signed-rank test on the
+# per-row absolute-error differences rejects "no improvement" at this
+# significance level. A flat MAE margin (the previous approach) is not
+# sample-size aware -- a 0.05F gap is easily noise on a 20-30 row window and
+# is essentially never noise on a 500-row window -- so the paired test
+# adapts the bar to how much evidence is actually present per station.
+ADAPTIVE_MIN_SELECTION_SAMPLES = 30
+ADAPTIVE_SELECTION_ALPHA = 0.10
+# BlendedResidualForecaster: the per-station blend weight is chosen by
+# minimizing MAE over a small (default 45-day) selection grid search, which
+# is itself noisy -- the argmin over 21 grid points on ~30-45 rows per
+# station can land far from 0 or 1 purely by sampling luck. Shrink the raw
+# grid-search weight toward an uninformative 50/50 prior, with the shrink
+# strength decaying as the selection window's own row count grows (an
+# empirical-Bayes-style partial pooling, not a hard cap): a station with
+# only the default-minimum ~30 selection rows is trusted much less than one
+# with a much larger window. `n / (n + BLEND_SHRINKAGE_PRIOR_ROWS)` is the
+# fraction of the raw estimate kept; the rest is pulled to 0.5.
+BLEND_SHRINKAGE_PRIOR_ROWS = 20
 NON_FEATURE_COLUMNS = {
     "target_date",
     "ghcn_id",
@@ -94,6 +129,58 @@ def _preprocessor(categorical: list[str], numeric: list[str], scale_numeric: boo
         remainder="drop",
         verbose_feature_names_out=False,
     )
+
+
+def _select_conformal_quantile_level(
+    ordered_abs_residual: np.ndarray,
+    base_quantile: float,
+    target_coverage: float,
+    max_quantile: float = CONFORMAL_QUANTILE_MAX,
+    min_split_rows: int = 40,
+    step: float = 0.01,
+) -> float:
+    """Self-correct the conformal quantile level using only calibration data.
+
+    A split-conformal half-width fitted on one static calibration window
+    tends to undercover once applied to a later, unseen period -- the
+    window's residual spread understates what the next stretch of days will
+    actually look like. This performs a leakage-free nested check entirely
+    inside the calibration block (never touching the test fold): the earlier
+    half of calibration residuals sets a candidate threshold, and the later
+    half (chronologically closer to the eventual test fold, but still
+    strictly before it) checks whether that threshold actually covers at the
+    target rate. The level is walked up from `base_quantile` until it does,
+    or until `max_quantile` is reached.
+
+    The acceptance test on the held-out half uses the *lower* bound of a
+    one-sided ~90% normal-approximation confidence interval around its own
+    observed coverage (z=1.28), not the raw point estimate. A ~600-row check
+    half's point-estimate coverage is itself a noisy statistic; accepting a
+    level the moment the point estimate merely touches the target lets
+    sampling noise pass a level that is not really adequate. Requiring the
+    confidence-interval lower bound to clear the target is still computed
+    purely from calibration-block rows -- it is a standard finite-sample
+    safety margin on the internal check, not a peek at test-fold outcomes.
+
+    `ordered_abs_residual` must already be sorted by ascending target_date.
+    """
+    n = len(ordered_abs_residual)
+    if n < 2 * min_split_rows:
+        return base_quantile
+    split = n // 2
+    fit_half = ordered_abs_residual[:split]
+    check_half = ordered_abs_residual[split:]
+    check_n = len(check_half)
+    z = 1.28
+    level = base_quantile
+    while level <= max_quantile + 1e-9:
+        threshold = float(np.nanquantile(fit_half, level))
+        covered = float(np.mean(check_half <= threshold))
+        covered_lower_bound = covered - z * np.sqrt(max(covered * (1.0 - covered), 0.0) / check_n)
+        if covered_lower_bound >= target_coverage:
+            return float(min(level, max_quantile))
+        level += step
+    return max_quantile
 
 
 @dataclass
@@ -225,6 +312,7 @@ class ResidualForecaster:
             )
             residual_frame = calibration[["station"]].copy()
             residual_frame["residual"] = raw_calibration_residual
+            residual_frame["target_date"] = pd.to_datetime(calibration["target_date"]).to_numpy()
             calibration_offset = float(residual_frame["residual"].median())
             calibration_offset_by_station = {
                 str(station): float(group["residual"].median())
@@ -232,13 +320,17 @@ class ResidualForecaster:
                 if len(group) >= 10
             }
             centered = residual_frame["residual"] - residual_frame["station"].map(calibration_offset_by_station).fillna(calibration_offset)
-            halfwidth = float(np.nanquantile(np.abs(centered), CONFORMAL_QUANTILE))
+            residual_frame["centered_abs"] = centered.abs()
+            # Determine the effective quantile level from calibration data
+            # alone (nested split, no test-fold rows involved) so the
+            # interval self-corrects for the undercoverage documented above.
+            global_ordered = residual_frame.sort_values("target_date")["centered_abs"].to_numpy(float)
+            quantile_level = _select_conformal_quantile_level(
+                global_ordered, CONFORMAL_QUANTILE, CONFORMAL_NOMINAL_COVERAGE
+            )
+            halfwidth = float(np.nanquantile(residual_frame["centered_abs"], quantile_level))
             halfwidth_by_station = {
-                str(station): float(
-                    np.nanquantile(
-                        np.abs(group["residual"] - calibration_offset_by_station[str(station)]), CONFORMAL_QUANTILE
-                    )
-                )
+                str(station): float(np.nanquantile(group["centered_abs"], quantile_level))
                 for station, group in residual_frame.groupby("station")
                 if str(station) in calibration_offset_by_station and len(group) >= 20
             }
@@ -336,13 +428,28 @@ class AdaptiveResidualForecaster:
             scored["ridge_ae"] = np.abs(scored[TARGET_COLUMN].to_numpy(float) - ridge_prediction)
             scored["xgb_ae"] = np.abs(scored[TARGET_COLUMN].to_numpy(float) - xgb_prediction)
             for station, group in scored.groupby("station", sort=True):
-                ridge_mae = float(group["ridge_ae"].mean())
-                xgb_mae = float(group["xgb_ae"].mean())
+                ridge_ae = group["ridge_ae"].to_numpy(float)
+                xgb_ae = group["xgb_ae"].to_numpy(float)
+                ridge_mae = float(ridge_ae.mean())
+                xgb_mae = float(xgb_ae.mean())
                 station_key = str(station)
-                selection_mae[station_key] = {"ridge": ridge_mae, "xgb": xgb_mae}
-                # Require a small practical improvement before switching away
-                # from XGB; this avoids noisy model flips in tiny differences.
-                selection[station_key] = "ridge" if ridge_mae + 0.05 < xgb_mae else "xgb"
+                n = int(len(group))
+                selection_mae[station_key] = {"ridge": ridge_mae, "xgb": xgb_mae, "n": float(n)}
+                chosen: Literal["ridge", "xgb"] = "xgb"
+                if n >= ADAPTIVE_MIN_SELECTION_SAMPLES and ridge_mae < xgb_mae and wilcoxon is not None:
+                    # diff > 0 where XGB's absolute error exceeds Ridge's;
+                    # one-sided test for "Ridge's errors are stochastically
+                    # smaller", never using any row past the calibration tail.
+                    diff = xgb_ae - ridge_ae
+                    if np.any(diff != 0):
+                        try:
+                            _, p_value = wilcoxon(diff, alternative="greater", zero_method="wilcox")
+                        except ValueError:
+                            p_value = 1.0
+                        selection_mae[station_key]["p_value"] = float(p_value)
+                        if p_value < ADAPTIVE_SELECTION_ALPHA:
+                            chosen = "ridge"
+                selection[station_key] = chosen
         return cls(
             kind="adaptive",
             ridge=ridge,
@@ -426,11 +533,18 @@ class BlendedResidualForecaster:
                 )
                 station_key = str(station)
                 best_index = int(np.argmin(losses))
-                weights[station_key] = float(grid[best_index])
+                raw_weight = float(grid[best_index])
+                n = int(len(group))
+                shrink = n / (n + BLEND_SHRINKAGE_PRIOR_ROWS)
+                shrunk_weight = 0.5 + (raw_weight - 0.5) * shrink
+                weights[station_key] = float(min(1.0, max(0.0, shrunk_weight)))
                 selection_mae[station_key] = {
                     "ridge": float(np.mean(np.abs(actual - ridge_values))),
                     "xgb": float(np.mean(np.abs(actual - xgb_values))),
                     "blend": float(losses[best_index]),
+                    "raw_weight": raw_weight,
+                    "shrunk_weight": weights[station_key],
+                    "n": float(n),
                 }
 
         ridge = ResidualForecaster.fit(usable, "ridge", calibration_days, random_state)

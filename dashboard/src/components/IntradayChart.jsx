@@ -87,6 +87,7 @@ export default function IntradayChart({ forecast }) {
       </svg>
       {hoverPoint && <div className="intraday-tooltip" style={{ left: `${(x(hoverPoint.x) / SVG_WIDTH) * 100}%` }}><strong>{Math.round(hoverPoint.y)}°F</strong><span>{stationTime(hoverPoint.x, timezone)} {timezone}</span></div>}
     </div>
+    {observations.length < 2 && <p className="intraday-data-note">Limited intraday readings are available for this station. The estimate and displayed range remain visible, but the observed-temperature trace will fill in after the next station update.</p>}
     <div className="intraday-stats">
       <span>Current <strong>{forecast.currentObservedTemperatureF ?? '—'}{forecast.currentObservedTemperatureF != null ? '°F' : ''}</strong></span>
       <span>High so far <strong>{forecast.observedHighSoFarF ?? '—'}{forecast.observedHighSoFarF != null ? '°F' : ''}</strong></span>
