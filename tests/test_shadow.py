@@ -29,11 +29,18 @@ def test_shadow_record_captures_model_and_source_provenance(monkeypatch):
         kind = "xgb"
         train_rows = 123
         calibration_rows = 20
+        numeric_columns = [
+            "ncep_nbm_conus__tmax_f",
+            "ncep_hrrr_conus__tmax_f",
+            "ncep_gfs_seamless__tmax_f",
+        ]
 
         def predict(self, _):
             return pd.DataFrame(
                 [{
                     "prediction_f": 80.0,
+                    "interval_lower_f": 77.0,
+                    "interval_upper_f": 83.0,
                     "p10_f": 77.0,
                     "p50_f": 80.0,
                     "p90_f": 83.0,
@@ -54,6 +61,7 @@ def test_shadow_record_captures_model_and_source_provenance(monkeypatch):
             "source_generationtime_ms": 1.2,
             "source_timezone": "America/New_York",
             "source_utc_offset_seconds": -14400,
+            "forecast_lead_days": 1,
         },
     )
     target = (pd.Timestamp.now(tz="America/New_York") + pd.Timedelta(days=1)).date()
@@ -61,3 +69,5 @@ def test_shadow_record_captures_model_and_source_provenance(monkeypatch):
     assert record["guidance_complete"] is True
     assert record["model_identity"]["artifact_sha256"] == "abc"
     assert record["source_provenance"]["provider"] == "Open-Meteo Forecast API"
+    assert record["forecast_lead_days"] == 1
+    assert record["interval_lower_f"] == 77.0

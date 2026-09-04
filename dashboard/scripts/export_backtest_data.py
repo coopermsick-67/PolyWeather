@@ -14,8 +14,8 @@ import pyarrow.parquet as pq
 
 
 ROOT = Path(__file__).resolve().parents[2]
-INPUT = ROOT / "artifacts" / "backtest_20_enhanced" / "rolling_predictions.parquet"
-ACCEPTANCE = ROOT / "artifacts" / "backtest_20_enhanced" / "acceptance.json"
+INPUT = ROOT / "artifacts" / "backtest_v4" / "rolling_predictions.parquet"
+ACCEPTANCE = ROOT / "artifacts" / "backtest_v4" / "acceptance.json"
 OUTPUT = ROOT / "dashboard" / "public" / "backtest-data.json"
 
 FIELDS = {
@@ -28,8 +28,13 @@ FIELDS = {
     "ridge_prediction_f": "ridgeF",
     "xgb_prediction_f": "xgbF",
     "blend_prediction_f": "blendF",
-    "p10_f": "p10F",
-    "p90_f": "p90F",
+    # The existing chart keys are retained for compatibility, but the shaded
+    # band is the coverage-calibrated interval.  True conditional tail
+    # estimates are exported separately and are not mislabeled as the band.
+    "interval_lower_f": "p10F",
+    "interval_upper_f": "p90F",
+    "p10_f": "quantileP10F",
+    "p90_f": "quantileP90F",
 }
 
 
@@ -52,7 +57,7 @@ def main() -> None:
     acceptance = json.loads(ACCEPTANCE.read_text(encoding="utf-8"))
     archive_fingerprint = hashlib.sha256(json.dumps(records, separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()[:12]
     payload = {
-        "version": "backtest_v3_20station",
+        "version": "backtest_v4_20station",
         "fingerprint": archive_fingerprint,
         "status": "SHADOW_ONLY",
         "target": "Official NOAA/NCEI local-day TMAX",

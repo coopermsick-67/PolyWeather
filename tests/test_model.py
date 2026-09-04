@@ -12,6 +12,7 @@ from polyweather.model import (
     BlendedResidualForecaster,
     ResidualForecaster,
     SeasonalClimatology,
+    _finite_sample_quantile,
     _select_conformal_quantile_level,
 )
 from polyweather.data import add_derived_forecast_features
@@ -48,6 +49,8 @@ def test_residual_forecaster_outputs_point_and_interval():
     prediction = model.predict(frame.tail(5))
     assert prediction.columns.tolist() == [
         "prediction_f",
+        "interval_lower_f",
+        "interval_upper_f",
         "p10_f",
         "p50_f",
         "p90_f",
@@ -56,6 +59,8 @@ def test_residual_forecaster_outputs_point_and_interval():
     ]
     assert (prediction["p10_f"] <= prediction["prediction_f"]).all()
     assert (prediction["prediction_f"] <= prediction["p90_f"]).all()
+    assert (prediction["interval_lower_f"] <= prediction["p10_f"]).all()
+    assert (prediction["p90_f"] <= prediction["interval_upper_f"]).all()
 
 
 def test_climatology_is_station_specific():
@@ -120,6 +125,19 @@ def test_select_conformal_quantile_level_does_not_max_out_on_stable_residuals():
     assert level < CONFORMAL_QUANTILE_MAX
 
 
+def test_finite_sample_quantile_uses_a_real_conservative_order_statistic():
+    values = np.asarray([1.0, 2.0, 3.0, 100.0])
+    assert _finite_sample_quantile(values, 0.75) == 100.0
+
+
+def test_training_rejects_mixed_forecast_horizons():
+    frame = _synthetic_training_data()
+    frame["forecast_lead_days"] = 1
+    frame.loc[frame.index[-1], "forecast_lead_days"] = 2
+    with np.testing.assert_raises_regex(ValueError, "separate artifacts per horizon"):
+        ResidualForecaster.fit(frame, "ridge", calibration_days=30)
+
+
 def _drifting_training_data(n_days: int = 500, seed: int = 7, drift_strength: float = 0.6) -> pd.DataFrame:
     """Ten stations with heavy-tailed (Student-t) residuals whose scale grows
     over the archive -- the realistic shape of a widening station roster or a
@@ -170,7 +188,7 @@ def test_conformal_interval_survives_realistic_drift_into_the_future():
     model = ResidualForecaster.fit(train, "ridge", calibration_days=60)
     prediction = model.predict(future)
     actual = future["tmax_f"].to_numpy()
-    covered = (actual >= prediction["p10_f"].to_numpy()) & (actual <= prediction["p90_f"].to_numpy())
+    covered = (actual >= prediction["interval_lower_f"].to_numpy()) & (actual <= prediction["interval_upper_f"].to_numpy())
     assert covered.mean() >= CONFORMAL_NOMINAL_COVERAGE
     assert model.conformal_quantile_level >= CONFORMAL_QUANTILE
 
@@ -187,7 +205,7 @@ def test_conformal_interval_stays_reasonably_sharp_without_drift():
     model = ResidualForecaster.fit(train, "ridge", calibration_days=60)
     prediction = model.predict(future)
     actual = future["tmax_f"].to_numpy()
-    covered = (actual >= prediction["p10_f"].to_numpy()) & (actual <= prediction["p90_f"].to_numpy())
+    covered = (actual >= prediction["interval_lower_f"].to_numpy()) & (actual <= prediction["interval_upper_f"].to_numpy())
     assert CONFORMAL_NOMINAL_COVERAGE <= covered.mean() <= 0.90
     assert model.conformal_quantile_level <= 0.90
 

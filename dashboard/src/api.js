@@ -61,12 +61,8 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 8_000) {
 
 function snapshotFallback(snapshot, date) {
   const today = new Intl.DateTimeFormat('sv-SE', { timeZone: 'America/New_York' }).format(new Date())
-  const forecasts = (snapshot.forecasts ?? []).map((forecast) => ({
-    ...forecast, targetDate: date, isCalibrated: false, dataQualityStatus: 'PACKAGED_SNAPSHOT_FALLBACK',
-    currentObservedTemperatureF: null, observedHighSoFarF: null, observedLowSoFarF: null, intradayObservations: [], lastObservationAt: null, dataFreshness: null, sourceAgreement: null,
-    reasonCodes: ['The live forecast service and direct guidance source are unavailable. These are the last packaged reference values, retained only so the board remains readable.'], stabilityReason: 'packaged_snapshot_fallback',
-  }))
-  return { ...snapshot, today, targetDate: date, maxDate: addIsoDays(today, 7), generatedAt: snapshot.generatedAt, forecasts, unavailableStations: [], marketForecast: false, forecastInputs: 'Last packaged forecast reference; live guidance is unavailable.', modelStatus: 'PACKAGED_SNAPSHOT_FALLBACK: these values are not a live forecast.', releaseStatus: 'Live forecast refresh is unavailable. Do not use this fallback for a weather pick.' }
+  const unavailableStations = (snapshot.stationRegistry ?? []).map((station) => station.stationId)
+  return { ...snapshot, today, targetDate: date, maxDate: addIsoDays(today, 7), generatedAt: null, forecasts: [], unavailableStations, marketForecast: false, forecastInputs: 'Live guidance is unavailable; no cached temperatures are substituted.', modelStatus: 'LIVE_DATA_UNAVAILABLE', releaseStatus: 'Live forecast refresh is unavailable. No stale or synthetic forecast values are displayed.' }
 }
 
 // The Worker is the normal source of truth. This client fallback is deliberately
@@ -99,9 +95,9 @@ async function getDirectGuidanceFallback(date, signal) {
     if (!Number.isFinite(value)) return null
     const high = Math.round(value)
     return {
-      ...(priorByStation.get(station.stationId) ?? {}), station: station.stationId, city: station.name, marketLocation: station.display_name, targetDate: date,
-      highF: high, rawModelHighF: high, baselineHighF: high, modelDeltaF: 0, rangeLowF: high - 4, rangeHighF: high + 4, fourDegreeRangeLowF: high - 2, fourDegreeRangeHighF: high + 2, modelRange: [high - 4, high + 4],
-      uncertainty: 'High', isCalibrated: false, currentObservedTemperatureF: null, observedHighSoFarF: null, observedLowSoFarF: null, intradayObservations: [], lastObservationAt: null, dataFreshness: null, sourceAgreement: null, sourceCount: 1,
+      ...(priorByStation.get(station.stationId) ?? {}), station: station.stationId, city: station.name, marketLocation: station.display_name, settlementNote: station.display_note, timezone: station.timezone, marketType: 'daily_high', targetDate: date,
+      highF: high, rawModelHighF: high, baselineHighF: high, modelDeltaF: 0, rangeLowF: null, rangeHighF: null, fourDegreeRangeLowF: null, fourDegreeRangeHighF: null, modelRange: null,
+      uncertainty: 'Unavailable', isCalibrated: false, currentObservedTemperatureF: null, observedHighSoFarF: null, observedLowSoFarF: null, intradayObservations: [], lastObservationAt: null, dataFreshness: null, sourceAgreement: null, modelSpreadF: null, sourceCount: 1, sourceName: 'Live NCEP NBM via Open-Meteo',
       dataQualityStatus: 'BROWSER_DIRECT_GUIDANCE_FALLBACK', reasonCodes: ['Live NCEP NBM daily guidance loaded directly because the forecast service is unavailable.'], stabilityReason: 'direct_guidance_fallback',
     }
   }).filter(Boolean)

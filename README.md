@@ -1,10 +1,12 @@
 # PolyWeather: daily high-temperature forecasting
 
-PolyWeather is a reproducible, leakage-aware research system for forecasting the official daily high temperature at KNYC, KMIA, KMDW, KLAX, and KSFO.
+PolyWeather is a reproducible, leakage-aware research system for forecasting the official daily high temperature at 20 configured U.S. settlement stations.
 
 **Current release status: `SHADOW_ONLY`.** The residual model materially improved the tested 24-hour-lead composite, but it has not yet passed prospective validation from one frozen operational issue-time contract. It is a useful forecasting candidate, not a promise that every future high will be accurate.
 
 ## What the system predicts
+
+The full registry is KATL, KAUS, KBOS, KDCA, KDEN, KDFW, KHOU, KLAS, KLAX, KMDW, KMIA, KMSP, KMSY, KNYC, KOKC, KPHL, KPHX, KSAT, KSEA, and KSFO. Representative identity mappings are shown below; the authoritative mapping is `src/polyweather/stations.py`.
 
 | ICAO | Location | NCEI station ID | Local target-day timezone |
 |---|---|---|---|
@@ -28,36 +30,36 @@ daily-TMAX forecast = NBM local-day hourly Tmax + learned residual
 
 The residual uses NBM, HRRR, and GFS hourly-profile summaries, station identity, and calendar features. A Ridge residual model is the transparent comparison model; a conservatively regularized XGBoost residual model is the selected candidate. Its prediction bands use a trailing, time-ordered 60-day calibration block and split-conformal residual widths.
 
-The dashboard uses the versioned XGBoost residual candidate in `artifacts/production_v2`. On the 2,459 untouched rolling forecasts its MAE was **1.783°F**, versus **2.651°F** for raw NBM. This remains a shadow-only result, not a guarantee of future accuracy or multi-day skill.
+The dashboard uses the versioned XGBoost residual candidate in `artifacts/production_v4`. On 10,279 rolling held-out forecasts its MAE was **1.750°F**, versus **2.411°F** for raw NBM. The residual correction is evaluated only for a one-day lead; today and days 2-7 show live numerical guidance without claiming residual calibration. This remains a shadow-only result, not a guarantee of future accuracy or multi-day skill.
 
 Important: a `previous_day1` daily maximum is an **hour-wise 24-hour-lead composite**, not the output of one forecast issuance frozen at a single clock time. It is leakage-resistant with respect to the outcome, but it is not yet the same contract as a once-daily operational forecast. That distinction is why the release is shadow-only.
 
 ## Clean rolling-origin result
 
-The final evaluation uses 16 contiguous, expanding-origin test folds. Each fold is 31 days except the final partial fold; all training rows predate their fold, and no station-date occurs in more than one held-out fold. The resulting sample contains **2,459 unique station-date forecasts** across **492 unique local dates**, from 2025-04-06 through 2026-08-10.
+The v4 evaluation uses contiguous, expanding-origin test folds. Each fold is 31 days except the final partial fold; all training rows predate their fold, and no station-date occurs in more than one held-out fold. The resulting sample contains **10,279 unique station-date forecasts** across **514 unique local dates**, from 2025-04-06 through 2026-09-01.
 
 | Model | MAE (°F) | RMSE (°F) | Bias (°F) | Within 2°F | MAE skill vs. NBM |
 |---|---:|---:|---:|---:|---:|
-| Seasonal climatology | 6.28 | 8.86 | -1.70 | 26.0% | -136.9% |
-| Raw NBM local-day Tmax | 2.65 | 3.31 | -1.91 | 45.2% | 0.0% |
-| Ridge residual | 1.88 | 2.53 | +0.19 | 64.9% | 29.2% |
-| XGBoost residual | **1.82** | **2.44** | **+0.17** | 64.0% | **31.2%** |
+| Seasonal climatology | 7.47 | 10.13 | -2.44 | 21.2% | -210.0% |
+| Raw NBM local-day Tmax | 2.41 | 3.04 | -1.51 | 50.3% | 0.0% |
+| Ridge residual | 1.88 | 2.52 | +0.15 | 63.4% | 22.0% |
+| XGBoost residual | **1.75** | **2.40** | **+0.22** | **67.9%** | **27.4%** |
 
-The date-block bootstrap 95% interval for XGBoost MAE is **1.76 to 1.89°F**; its MAE-skill interval versus raw NBM is **29.0% to 33.2%**. The nominal 75% prediction interval covered 71.2% of held-out outcomes, with a mean width of 4.48°F. A fixed ±2°F (four-degree) planning range contained 66.6% of held-out outcomes. These are retrospective results for this exact target, data vintage, lead convention, and station set.
+The date-block bootstrap 95% interval for XGBoost MAE is **1.72 to 1.79°F**; its MAE-skill interval versus raw NBM is **26.0% to 28.8%**. The nominal 80% asymmetric prediction interval covered **84.6%** of held-out outcomes, with a mean width of 6.65°F; every station exceeded the 75% severe-undercoverage floor. A fixed ±2°F planning reference contained 67.9% of held-out outcomes. These are retrospective results for this exact target, data vintage, lead convention, and station set.
 
 | Station | Raw NBM MAE | XGBoost MAE | XGBoost bias | XGBoost skill | Held-out n |
 |---|---:|---:|---:|---:|---:|
-| KLAX | 3.62 | 1.70 | -0.09 | 53.1% | 492 |
-| KMDW | 2.28 | 2.05 | +0.14 | 9.8% | 492 |
-| KMIA | 2.44 | 1.16 | +0.06 | 52.6% | 491 |
-| KNYC | 2.16 | 1.87 | +0.31 | 13.2% | 492 |
-| KSFO | 2.76 | 2.34 | +0.44 | 15.2% | 492 |
+| KLAX | 3.69 | 1.64 | -0.14 | 55.6% | 514 |
+| KMDW | 2.27 | 1.89 | +0.18 | 16.8% | 514 |
+| KMIA | 2.45 | 1.16 | -0.02 | 52.5% | 513 |
+| KNYC | 2.14 | 1.74 | +0.25 | 18.7% | 514 |
+| KSFO | 2.73 | 2.37 | +0.62 | 13.2% | 514 |
 
-The model improved over raw NBM at all five stations, but the size of the improvement is uneven. KLAX and KMIA drive much of the gain; KMDW, KNYC, and KSFO have smaller margins. That heterogeneity is reason to monitor station-level performance rather than deploy on the global MAE alone.
+The model improved over raw NBM at all 20 stations, but the size of the improvement is uneven: station skill ranges from 8.2% at KDFW to 55.6% at KLAX. That heterogeneity is why release gates and monitoring operate by station rather than on global MAE alone.
 
 ## Data quality and lineage
 
-The current training table has 3,359 station-date rows, covering 2024-10-08 through 2026-08-10. Quality checks found zero duplicate station-date rows, no missing target or NBM-baseline values, labels in a plausible 2.0 to 100.0°F range, and NBM baselines in a plausible 3.6 to 101.5°F range. Five rows have less than 90% NBM hourly-profile availability. Fields that are entirely unavailable in this archived feed are excluded automatically rather than imputed as invented weather.
+The v4 training table has 13,879 station-date rows, covering 2024-10-08 through 2026-09-01. Quality checks found zero duplicate station-date rows, no missing target, NBM-baseline, or core-model Tmax values, labels in a plausible -9.0 to 118.0°F range, and NBM baselines in a plausible -9.0 to 116.2°F range. Six NBM fields that are entirely unavailable in this archive are excluded automatically rather than imputed as invented weather. KMIA has one missing official station-day; it remains absent rather than synthesized.
 
 | Role | Source used now | Why it matters |
 |---|---|---|
@@ -85,37 +87,37 @@ Build the labeled archived-feature table and run its quality audit:
 ```powershell
 .\.venv\Scripts\python.exe -m polyweather.cli build-data `
   --start 2024-10-08 --end 2026-08-11 `
-  --output data\features\tmax_24h_composite_training.parquet
+  --output data\features\tmax_24h_composite_training_v4.parquet
 
 .\.venv\Scripts\python.exe -m polyweather.cli quality `
-  --data data\features\tmax_24h_composite_training.parquet `
-  --output-dir artifacts\quality
+  --data data\features\tmax_24h_composite_training_v4.parquet `
+  --output-dir artifacts\quality_v4
 ```
 
 Run the clean rolling evaluation, fit the candidate, and generate the model card and charts:
 
 ```powershell
 .\.venv\Scripts\python.exe -m polyweather.cli backtest `
-  --data data\features\tmax_24h_composite_training.parquet `
-  --output-dir artifacts\backtest
+  --data data\features\tmax_24h_composite_training_v4.parquet `
+  --output-dir artifacts\backtest_v4
 
 .\.venv\Scripts\python.exe -m polyweather.cli train `
-  --data data\features\tmax_24h_composite_training.parquet `
-  --kind xgb --output-dir artifacts\production
+  --data data\features\tmax_24h_composite_training_v4.parquet `
+  --kind xgb --output-dir artifacts\production_v4
 
 .\.venv\Scripts\python.exe -m polyweather.cli report `
-  --backtest-dir artifacts\backtest --output-dir reports
+  --backtest-dir artifacts\backtest_v4 --output-dir reports
 ```
 
 Generate a current forecast or begin the append-only shadow log:
 
 ```powershell
 .\.venv\Scripts\python.exe -m polyweather.cli predict `
-  --model artifacts\production\xgb_residual_tmax.joblib `
+  --model artifacts\production_v4\xgb_residual_tmax.joblib `
   --stations all
 
 .\.venv\Scripts\python.exe -m polyweather.cli log-current `
-  --model artifacts\production\xgb_residual_tmax.joblib `
+  --model artifacts\production_v4\xgb_residual_tmax.joblib `
   --stations all --log data\normalized\shadow_forecasts.jsonl
 
 .\.venv\Scripts\python.exe -m polyweather.cli verify-shadow `
@@ -127,7 +129,7 @@ Generate a current forecast or begin the append-only shadow log:
 
 ## Local dashboard
 
-The dashboard is a real React/Vite application. It calls the local trained-model adapter on refresh, shows a fixed ±2°F four-degree planning range (66.6% historical coverage on the untouched backtest), and exposes the wider per-station nominal-75% split-conformal range in station details. It includes the rolling shadow-monitoring chart and labels the product as experimental. It automatically rolls from today through the next seven calendar days (including in an open tab after midnight); today's estimate is never allowed below the latest observed NWS station temperature.
+The dashboard is a real React/Vite application. It calls the local trained-model adapter on refresh and exposes the v4 nominal-80% interval only for the evaluated one-day horizon. For today and days 2-7 it shows real live NBM/NWS guidance without applying the one-day residual model or manufacturing an uncertainty band. If every live source fails, it shows an unavailable state instead of packaged temperatures. It includes the rolling shadow-monitoring chart and labels the product as experimental.
 
 Forecasts are also display-stable: the latest model is recomputed on refresh, but a station/day’s displayed high remains unchanged for moves smaller than 2°F. A material 2°F-or-greater model shift, or a higher observed temperature today, updates it. This local continuity state is kept in `data\normalized\dashboard_forecast_state.json`.
 

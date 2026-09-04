@@ -5,9 +5,11 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
-from .model import BASELINE_COLUMN, TARGET_COLUMN
+from .data import MODEL_SOURCES
+from .model import BASELINE_COLUMN, SUPPORTED_FORECAST_LEAD_DAYS, TARGET_COLUMN
 
 
 def assess_training_table(table: pd.DataFrame) -> dict[str, object]:
@@ -15,10 +17,29 @@ def assess_training_table(table: pd.DataFrame) -> dict[str, object]:
     data = table.copy()
     data["target_date"] = pd.to_datetime(data["target_date"])
     required = ["station", "target_date", TARGET_COLUMN, BASELINE_COLUMN]
+    absent_required = [column for column in required if column not in data]
+    if absent_required:
+        raise ValueError(f"Training table is missing required columns: {', '.join(absent_required)}")
     missing_required = {column: int(data[column].isna().sum()) for column in required if column in data}
     numeric = data.select_dtypes(include="number")
     missing_rates = (numeric.isna().mean().sort_values(ascending=False) * 100).round(2)
-    low_availability = int((data.get("ncep_nbm_conus__availability", pd.Series(1.0, index=data.index)) < 0.90).sum())
+    availability_rows = {
+        model: int((pd.to_numeric(data.get(f"{model}__availability", pd.Series(np.nan, index=data.index)), errors="coerce") < 0.90).sum())
+        for model in MODEL_SOURCES
+    }
+    core_columns = [f"{model}__tmax_f" for model in MODEL_SOURCES]
+    missing_core_guidance = int(
+        (~np.isfinite(data.reindex(columns=core_columns).apply(pd.to_numeric, errors="coerce"))).any(axis=1).sum()
+    )
+    all_missing_numeric = sorted(column for column in numeric if numeric[column].isna().all())
+    leads = sorted(pd.to_numeric(data.get("forecast_lead_days", pd.Series(dtype=float)), errors="coerce").dropna().astype(int).unique().tolist())
+    unsupported_leads = [lead for lead in leads if lead != SUPPORTED_FORECAST_LEAD_DAYS]
+    daily_station_counts = data.groupby("target_date")["station"].nunique()
+    station_gap_rows = []
+    for station, group in data.groupby("station", sort=True):
+        dates = pd.DatetimeIndex(group["target_date"].dropna().sort_values().unique())
+        expected_days = (dates.max() - dates.min()).days + 1 if len(dates) else 0
+        station_gap_rows.append({"station": str(station), "missing_calendar_days": int(expected_days - len(dates))})
     station_rows = (
         data.groupby("station")
         .agg(
@@ -42,7 +63,15 @@ def assess_training_table(table: pd.DataFrame) -> dict[str, object]:
         "nbm_baseline_range_f": [float(data[BASELINE_COLUMN].min()), float(data[BASELINE_COLUMN].max())],
         "implausible_tmax_rows": int(((data[TARGET_COLUMN] < -60) | (data[TARGET_COLUMN] > 140)).sum()),
         "implausible_nbm_rows": int(((data[BASELINE_COLUMN] < -80) | (data[BASELINE_COLUMN] > 140)).sum()),
-        "nbm_profile_availability_below_90pct_rows": low_availability,
+        "profile_availability_below_90pct_rows": availability_rows,
+        "rows_missing_any_core_model_tmax": missing_core_guidance,
+        "all_missing_numeric_columns": all_missing_numeric,
+        "forecast_lead_days": leads,
+        "unsupported_forecast_lead_days": unsupported_leads,
+        "station_count_per_day_min": int(daily_station_counts.min()),
+        "station_count_per_day_max": int(daily_station_counts.max()),
+        "station_calendar_gaps": station_gap_rows,
+        "training_table_hash_values": int(data.get("training_table_sha256", pd.Series(dtype=str)).replace("", pd.NA).nunique(dropna=True)),
         "station_coverage": station_rows.assign(
             first_date=station_rows["first_date"].dt.date.astype(str),
             last_date=station_rows["last_date"].dt.date.astype(str),
@@ -67,7 +96,10 @@ def write_quality_report(table: pd.DataFrame, output_dir: str | Path) -> Path:
         f"- TMAX range: {report['tmax_range_f'][0]:.1f} to {report['tmax_range_f'][1]:.1f} °F",
         f"- NBM baseline range: {report['nbm_baseline_range_f'][0]:.1f} to {report['nbm_baseline_range_f'][1]:.1f} °F",
         f"- Implausible labels/baselines: {report['implausible_tmax_rows']} / {report['implausible_nbm_rows']}",
-        f"- NBM profiles below 90% hourly availability: {report['nbm_profile_availability_below_90pct_rows']}",
+        f"- Rows missing any core-model Tmax: {report['rows_missing_any_core_model_tmax']}",
+        f"- Forecast lead days present: {report['forecast_lead_days']} (unsupported: {report['unsupported_forecast_lead_days']})",
+        f"- All-missing numeric columns excluded by training: {len(report['all_missing_numeric_columns'])}",
+        f"- Profiles below 90% hourly availability: {report['profile_availability_below_90pct_rows']}",
         "",
         "## Station coverage",
         "",

@@ -47,4 +47,31 @@ def test_partial_guidance_never_uses_residual_model_or_marks_a_pick():
     assert forecast["isCalibrated"] is False
     assert forecast["guidanceComplete"] is False
     assert forecast["dataQualityStatus"] == QualityStatus.NO_BET.value
+    assert forecast["rangeLowF"] is None
+    assert forecast["rangeHighF"] is None
     assert any("complete NBM, HRRR, and GFS" in reason for reason in forecast["reasonCodes"])
+
+
+def test_unsupported_horizon_uses_real_nbm_without_inventing_an_interval():
+    class Model:
+        numeric_columns = ["ncep_nbm_conus__tmax_f", "ncep_hrrr_conus__tmax_f", "ncep_gfs_seamless__tmax_f"]
+
+        def predict(self, _):  # pragma: no cover - assertion is the behavior under test
+            raise AssertionError("an unsupported horizon must not reach residual inference")
+
+    features = {
+        "nbm_baseline_f": 80.0,
+        "ncep_nbm_conus__tmax_f": 80.0,
+        "ncep_hrrr_conus__tmax_f": 81.0,
+        "ncep_gfs_seamless__tmax_f": 79.0,
+        "forecast_lead_days": 3,
+    }
+    forecasts, _ = _build_forecasts(
+        [(STATIONS["KNYC"], features, None)], Model(), {"KNYC"}, "test", date(2026, 9, 7), {}, {"forecasts": {}}
+    )
+    forecast = forecasts[0]
+    assert forecast["highF"] == 80
+    assert forecast["isCalibrated"] is False
+    assert forecast["supportedHorizon"] is False
+    assert forecast["modelRange"] is None
+    assert forecast["uncertainty"] == "Unavailable"

@@ -12,7 +12,12 @@ import pandas as pd
 
 from .data import MODEL_SOURCES, fetch_live_forecast_features, fetch_ncei_daily_tmax, has_complete_core_guidance
 from .metrics import forecast_metrics, interval_metrics
-from .model import ResidualForecaster
+from .model import (
+    MIN_PREDICTION_FEATURE_COMPLETENESS,
+    SUPPORTED_FORECAST_LEAD_DAYS,
+    ResidualForecaster,
+    feature_completeness,
+)
 from .stations import Station
 
 
@@ -40,9 +45,21 @@ def create_shadow_records(
                 f"({local_today.isoformat()}); received {target_date.isoformat()}."
             )
         features = fetch_live_forecast_features(station, target_date)
+        lead_days = int(features.get("forecast_lead_days", -1))
+        if lead_days != SUPPORTED_FORECAST_LEAD_DAYS:
+            raise ValueError(
+                f"{station.icao}: residual MOS is evaluated only at a "
+                f"{SUPPORTED_FORECAST_LEAD_DAYS}-day lead; received {lead_days}."
+            )
         if not has_complete_core_guidance(features):
             raise ValueError(
                 f"{station.icao}: refusing shadow snapshot without complete NBM, HRRR, and GFS guidance."
+            )
+        completeness = float(feature_completeness(model, pd.DataFrame([features]))[0])
+        if completeness < MIN_PREDICTION_FEATURE_COMPLETENESS:
+            raise ValueError(
+                f"{station.icao}: refusing shadow snapshot with only {completeness:.0%} "
+                f"finite model features (minimum {MIN_PREDICTION_FEATURE_COMPLETENESS:.0%})."
             )
         output = model.predict(pd.DataFrame([features])).iloc[0].to_dict()
         records.append(
@@ -56,6 +73,8 @@ def create_shadow_records(
                 "source_models": ["NCEP NBM CONUS", "NCEP HRRR CONUS", "NCEP GFS Seamless"],
                 "required_source_models": list(MODEL_SOURCES),
                 "guidance_complete": True,
+                "feature_completeness": completeness,
+                "forecast_lead_days": lead_days,
                 "record_schema_version": "v2_prospective_full_guidance",
                 "model_family": f"{model.kind.title()} residual MOS",
                 "model_identity": {
@@ -67,6 +86,8 @@ def create_shadow_records(
                 },
                 "nbm_baseline_f": float(features["nbm_baseline_f"]),
                 "forecast_f": float(output["prediction_f"]),
+                "interval_lower_f": float(output["interval_lower_f"]),
+                "interval_upper_f": float(output["interval_upper_f"]),
                 "p10_f": float(output["p10_f"]),
                 "p50_f": float(output["p50_f"]),
                 "p90_f": float(output["p90_f"]),
@@ -158,5 +179,7 @@ def verify_shadow_log(path: str | Path) -> tuple[pd.DataFrame, dict[str, float]]
     labels = fetch_ncei_daily_tmax(requested, mature["target_date"].min(), mature["target_date"].max())
     verified = mature.merge(labels[["station", "target_date", "tmax_f"]], on=["station", "target_date"], how="inner")
     metrics = forecast_metrics(verified, "tmax_f", "forecast_f")
-    metrics.update(interval_metrics(verified, actual="tmax_f", lower="p10_f", upper="p90_f"))
+    lower = "interval_lower_f" if "interval_lower_f" in verified else "p10_f"
+    upper = "interval_upper_f" if "interval_upper_f" in verified else "p90_f"
+    metrics.update(interval_metrics(verified, actual="tmax_f", lower=lower, upper=upper))
     return verified, metrics

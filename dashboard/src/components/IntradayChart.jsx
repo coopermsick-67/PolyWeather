@@ -43,8 +43,10 @@ export default function IntradayChart({ forecast }) {
   const { start: dayStart, end: dayEnd } = stationDayBounds(targetDate, timezone)
   const dayDuration = dayEnd - dayStart
   const isToday = targetDate === stationIsoDate(now, timezone)
-  const low = Math.floor(Math.min(forecast.rangeLowF, forecast.baselineHighF, ...(observations.map((item) => item.y)), forecast.currentObservedTemperatureF ?? forecast.rangeLowF) - 3)
-  const high = Math.ceil(Math.max(forecast.rangeHighF, forecast.baselineHighF, ...(observations.map((item) => item.y)), forecast.currentObservedTemperatureF ?? forecast.rangeHighF) + 3)
+  const hasBand = Number.isFinite(forecast.rangeLowF) && Number.isFinite(forecast.rangeHighF)
+  const scaleValues = [forecast.rangeLowF, forecast.rangeHighF, forecast.highF, forecast.baselineHighF, ...observations.map((item) => item.y), forecast.currentObservedTemperatureF].filter(Number.isFinite)
+  const low = Math.floor(Math.min(...scaleValues) - 3)
+  const high = Math.ceil(Math.max(...scaleValues) + 3)
   const chartBottom = 170
   const chartTop = 38
   const x = (value) => CHART_LEFT + ((Math.max(dayStart, Math.min(dayEnd, value)) - dayStart) / dayDuration) * CHART_WIDTH
@@ -72,11 +74,11 @@ export default function IntradayChart({ forecast }) {
         <div className={`evidence-pill ${forecast.dataFreshness >= 1 ? 'is-fresh' : 'is-stale'}`}>{sourceStatus}</div>
       </div>
     </div>
-    <div className="intraday-legend"><span><i className="observed" />Observed</span><span><i className="projected" />Daily-high estimate</span><span><i className="baseline" />NBM baseline</span><span><i className="band" />Displayed uncertainty band</span></div>
+    <div className="intraday-legend"><span><i className="observed" />Observed</span><span><i className="projected" />Daily-high estimate</span><span><i className="baseline" />NBM baseline</span><span><i className="band" />{hasBand ? 'Calibrated interval' : 'Interval unavailable'}</span></div>
     <div className="intraday-chart" ref={scrollRef}>
       <svg viewBox="0 0 880 200" role="img" aria-label={`Live intraday temperature chart for ${forecast.station}`} onPointerMove={onPointerMove} onPointerLeave={() => setHoverX(null)}>
         {[low, Math.round((low + high) / 2), high].map((tick) => <g key={tick}><line x1={CHART_LEFT} x2="856" y1={y(tick)} y2={y(tick)} className="intraday-grid" /><text x="9" y={y(tick) + 4}>{tick}°</text></g>)}
-        <rect x={CHART_LEFT} y={y(forecast.rangeHighF)} width={CHART_WIDTH} height={Math.max(1, y(forecast.rangeLowF) - y(forecast.rangeHighF))} className="range-band" />
+        {hasBand && <rect x={CHART_LEFT} y={y(forecast.rangeHighF)} width={CHART_WIDTH} height={Math.max(1, y(forecast.rangeLowF) - y(forecast.rangeHighF))} className="range-band" />}
         <line x1={CHART_LEFT} x2="856" y1={y(forecast.baselineHighF)} y2={y(forecast.baselineHighF)} className="baseline-line" />
         <line x1={CHART_LEFT} x2="856" y1={y(forecast.highF)} y2={y(forecast.highF)} className="estimate-line" />
         {observations.length > 1 && <path d={path(observations, x, y)} className="observed-line" />}
@@ -87,7 +89,7 @@ export default function IntradayChart({ forecast }) {
       </svg>
       {hoverPoint && <div className="intraday-tooltip" style={{ left: `${(x(hoverPoint.x) / SVG_WIDTH) * 100}%` }}><strong>{Math.round(hoverPoint.y)}°F</strong><span>{stationTime(hoverPoint.x, timezone)} {timezone}</span></div>}
     </div>
-    {observations.length < 2 && <p className="intraday-data-note">Limited intraday readings are available for this station. The estimate and displayed range remain visible, but the observed-temperature trace will fill in after the next station update.</p>}
+    {observations.length < 2 && <p className="intraday-data-note">Limited intraday readings are available for this station. The live point guidance remains visible; the observed-temperature trace will fill in after the next station update.</p>}
     <div className="intraday-stats">
       <span>Current <strong>{forecast.currentObservedTemperatureF ?? '—'}{forecast.currentObservedTemperatureF != null ? '°F' : ''}</strong></span>
       <span>High so far <strong>{forecast.observedHighSoFarF ?? '—'}{forecast.observedHighSoFarF != null ? '°F' : ''}</strong></span>
@@ -96,7 +98,7 @@ export default function IntradayChart({ forecast }) {
         <span>Live NBM baseline <strong>{forecast.baselineHighF}°F</strong></span>
         <span>Calibrated high <strong>{forecast.highF}°F</strong></span>
       </> : <span>Live NBM baseline <strong>{forecast.baselineHighF}°F</strong><small>Shown as-is; not yet calibrated</small></span>}
-      <span>4° planning range <strong>{forecast.fourDegreeRangeLowF}°–{forecast.fourDegreeRangeHighF}°</strong><small>Not a live-calibrated interval</small></span>
+      <span>80% calibrated interval <strong>{hasBand ? `${forecast.rangeLowF}°–${forecast.rangeHighF}°` : 'Unavailable'}</strong><small>{hasBand ? 'Estimated from held-out residuals' : 'No interval is manufactured for fallback guidance'}</small></span>
     </div>
     {forecast.reasonCodes?.length > 0 && <ul className="intraday-reasons">{forecast.reasonCodes.map((reason) => <li key={reason}>{reason}</li>)}</ul>}
   </section>

@@ -14,8 +14,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 SNAPSHOT = ROOT / "dashboard" / "public" / "dashboard-snapshot.json"
-STATION_METRICS = ROOT / "artifacts" / "backtest_20_enhanced" / "station_metrics.csv"
-OVERALL_METRICS = ROOT / "artifacts" / "backtest_20_enhanced" / "overall_metrics.csv"
+STATION_METRICS = ROOT / "artifacts" / "backtest_v4" / "station_metrics.csv"
+OVERALL_METRICS = ROOT / "artifacts" / "backtest_v4" / "overall_metrics.csv"
 MODEL = "XGBoost residual"
 
 
@@ -30,6 +30,13 @@ def number(row: dict[str, str], key: str) -> float:
 
 def main() -> None:
     snapshot = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+    # The snapshot is now metadata/evidence only.  Shipping dated forecast
+    # values here lets a network failure masquerade as a live prediction.
+    snapshot["forecasts"] = []
+    snapshot["generatedAt"] = None
+    snapshot["targetDate"] = None
+    snapshot["evaluationContract"] = "10,279 held-out station-day forecasts; archived 24-hour lead composite"
+    snapshot["modelStatus"] = "SHADOW_ONLY v4; live values are never read from this file"
     stations = [row for row in metric_rows(STATION_METRICS) if row["model"] == MODEL]
     stations.sort(key=lambda row: number(row, "mae_f"))
     snapshot["accuracy"] = [
@@ -53,7 +60,7 @@ def main() -> None:
         "skillPct": round(number(candidate, "mae_skill_vs_nbm") * 100),
         "within2Pct": round(number(candidate, "within_2f") * 100),
         "testForecasts": int(number(candidate, "n")),
-        "fourDegreeCoveragePct": round(number(candidate, "coverage") * 100),
+        "fourDegreeCoveragePct": round(number(candidate, "within_2f") * 100),
         "calibratedCoveragePct": round(number(candidate, "coverage") * 100),
         "calibratedMeanWidthF": round(number(candidate, "mean_width_f"), 1),
     }

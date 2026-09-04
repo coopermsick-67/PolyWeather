@@ -62,6 +62,7 @@ export default function ForecastFanChart({ forecast }) {
   const spread = Number.isFinite(forecast.modelSpreadF) ? forecast.modelSpreadF.toFixed(1) : null
   const highSoFar = Number.isFinite(forecast.observedHighSoFarF) ? forecast.observedHighSoFarF : null
   const hasObservationTrace = observations.length > 1
+  const hasBand = Number.isFinite(forecast.rangeLowF) && Number.isFinite(forecast.rangeHighF)
 
   return <section className="forecast-fan-card" aria-labelledby="forecast-fan-title">
     <div className="forecast-fan-heading">
@@ -82,12 +83,12 @@ export default function ForecastFanChart({ forecast }) {
           <span><i className="fan-observed" />Observed temperature</span>
           <span><i className="fan-estimate" />Daily estimate</span>
           <span><i className="fan-baseline" />NBM baseline</span>
-          <span><i className="fan-band" />Displayed band</span>
+          <span><i className="fan-band" />{hasBand ? 'Calibrated interval' : 'Interval unavailable'}</span>
         </div>
         <div className="forecast-fan-svg-wrap">
           <svg viewBox="0 0 810 222" role="img" aria-label={`Daily high forecast graph for ${forecast.station}. Estimate ${forecast.highF} degrees Fahrenheit, NBM baseline ${forecast.baselineHighF} degrees Fahrenheit.`}>
             {[low, Math.round((low + high) / 2), high].map((tick) => <g key={tick}><line className="fan-grid" x1={LEFT} x2={RIGHT} y1={y(tick)} y2={y(tick)} /><text x="8" y={y(tick) + 4}>{tick}°</text></g>)}
-            <rect className="fan-band-area" x={LEFT} y={y(forecast.rangeHighF)} width={WIDTH} height={Math.max(1, y(forecast.rangeLowF) - y(forecast.rangeHighF))} />
+            {hasBand && <rect className="fan-band-area" x={LEFT} y={y(forecast.rangeHighF)} width={WIDTH} height={Math.max(1, y(forecast.rangeLowF) - y(forecast.rangeHighF))} />}
             <line className="fan-baseline-line" x1={LEFT} x2={RIGHT} y1={y(forecast.baselineHighF)} y2={y(forecast.baselineHighF)} />
             <line className="fan-estimate-line" x1={LEFT} x2={RIGHT} y1={y(forecast.highF)} y2={y(forecast.highF)} />
             {hasObservationTrace && <path className="fan-observed-line" d={linePath(observations, x, y)} />}
@@ -96,7 +97,7 @@ export default function ForecastFanChart({ forecast }) {
             {ticks.map((time) => <text className="fan-axis" key={time} x={x(time)} y="215" textAnchor="middle">{stationTime(time, timezone)}</text>)}
           </svg>
         </div>
-        <p className="forecast-fan-note">The blue band is the displayed daily-high range, not a projected hour-by-hour temperature path. {hasObservationTrace ? 'The white line is reported station temperature.' : 'No intraday trace is available for this selected date yet.'}</p>
+        <p className="forecast-fan-note">{hasBand ? 'The blue band is the calibrated daily-high interval, not a projected hour-by-hour path.' : 'No calibrated uncertainty interval is available for this fallback value.'} {hasObservationTrace ? 'The white line is reported station temperature.' : 'No intraday trace is available for this selected date yet.'}</p>
       </div>
 
       <aside className="forecast-fan-evidence" aria-label="Source agreement">
@@ -104,7 +105,7 @@ export default function ForecastFanChart({ forecast }) {
         <AgreementGauge value={agreement} />
         <p>{spread == null ? 'Model spread has not been reported.' : `${spread}°F spread across available source highs.`}</p>
         <dl>
-          <div><dt>Displayed band</dt><dd>{forecast.rangeLowF}°–{forecast.rangeHighF}°</dd></div>
+          <div><dt>Calibrated interval</dt><dd>{hasBand ? `${forecast.rangeLowF}°–${forecast.rangeHighF}°` : 'Unavailable'}</dd></div>
           <div><dt>Observed high so far</dt><dd>{highSoFar == null ? '—' : `${highSoFar}°F`}</dd></div>
         </dl>
         <small>Agreement measures the spread of available guidance, not the chance of a correct settlement.</small>

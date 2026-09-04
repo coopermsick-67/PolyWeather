@@ -22,17 +22,23 @@ import pandas as pd
 
 from .data import MODEL_SOURCES, fetch_live_forecast_features, fetch_live_station_snapshot, has_complete_core_guidance
 from .markets import QualityStatus, quality_gate
-from .model import AdaptiveResidualForecaster, BlendedResidualForecaster, ResidualForecaster
+from .model import (
+    MIN_PREDICTION_FEATURE_COMPLETENESS,
+    SUPPORTED_FORECAST_LEAD_DAYS,
+    AdaptiveResidualForecaster,
+    BlendedResidualForecaster,
+    ResidualForecaster,
+    feature_completeness,
+)
 from .stations import STATIONS, station_metadata
 
 
 ROOT = Path(__file__).resolve().parents[2]
-# The local/Render adapter must use the same v3 artifact family as the Sites
-# worker. It must not silently fall back to the old five-station v2 bundle.
-MODEL_PATH = ROOT / "artifacts" / "production_v3" / "xgb_residual_tmax.joblib"
-PREDICTIONS_PATH = ROOT / "artifacts" / "backtest_20_enhanced" / "rolling_predictions.parquet"
-STATION_METRICS_PATH = ROOT / "artifacts" / "backtest_20_enhanced" / "station_metrics.csv"
-OVERALL_METRICS_PATH = ROOT / "artifacts" / "backtest_20_enhanced" / "overall_metrics.csv"
+# The local/Render adapter uses the same audited v4 evidence family throughout.
+MODEL_PATH = ROOT / "artifacts" / "production_v4" / "xgb_residual_tmax.joblib"
+PREDICTIONS_PATH = ROOT / "artifacts" / "backtest_v4" / "rolling_predictions.parquet"
+STATION_METRICS_PATH = ROOT / "artifacts" / "backtest_v4" / "station_metrics.csv"
+OVERALL_METRICS_PATH = ROOT / "artifacts" / "backtest_v4" / "overall_metrics.csv"
 DASHBOARD_TIMEZONE = ZoneInfo("America/New_York")
 STABILITY_STATE_PATH = ROOT / "data" / "normalized" / "dashboard_forecast_state.json"
 MIN_STABLE_CHANGE_F = 2
@@ -273,8 +279,8 @@ def _select_model_path() -> Path:
     """
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
-            f"Required v3 20-station model artifact is missing: {MODEL_PATH}. "
-            "Rebuild production_v3 before serving forecasts."
+            f"Required v4 20-station model artifact is missing: {MODEL_PATH}. "
+            "Rebuild production_v4 before serving forecasts."
         )
     return MODEL_PATH
 
@@ -342,10 +348,19 @@ def _build_forecasts(
         icao = station.icao
         baseline_high = float(features.get("nbm_baseline_f", np.nan))
         complete_guidance = has_complete_core_guidance(features)
+        lead_days = int(features.get("forecast_lead_days", -1))
+        supported_horizon = lead_days == SUPPORTED_FORECAST_LEAD_DAYS
+        completeness = float(feature_completeness(model, pd.DataFrame([features]))[0])
+        features_sufficient = completeness >= MIN_PREDICTION_FEATURE_COMPLETENESS
         # The deployed residual correction was evaluated with all three
         # guidance sources. Do not let the estimator's missing-value imputer
         # turn a partial upstream response into a supposedly calibrated pick.
-        is_calibrated = icao in trained_station_ids and complete_guidance
+        is_calibrated = (
+            icao in trained_station_ids
+            and complete_guidance
+            and supported_horizon
+            and features_sufficient
+        )
         prediction = model.predict(pd.DataFrame([features])).iloc[0] if is_calibrated else None
         predicted_high = float(prediction["prediction_f"]) if prediction is not None else baseline_high
         if not np.isfinite(predicted_high) or not np.isfinite(baseline_high):
@@ -371,7 +386,10 @@ def _build_forecasts(
             "candidate_high_f": candidate_high,
             "updated_at_utc": datetime.now(timezone.utc).isoformat(),
         }
-        half_width = float(prediction["conformal_halfwidth_f"]) if prediction is not None else 4.0
+        interval_lower = float(prediction["interval_lower_f"]) if prediction is not None else None
+        interval_upper = float(prediction["interval_upper_f"]) if prediction is not None else None
+        interval_width = interval_upper - interval_lower if prediction is not None else None
+        half_width = interval_width / 2.0 if interval_width is not None else None
         disagreement_f = float(features.get("model_agreement__tmax_f_spread", np.nan))
         source_agreement = max(0.0, min(1.0, 1.0 - disagreement_f / 8.0)) if np.isfinite(disagreement_f) else 0.0
         freshness = 0.0 if observation and observation.get("stale") else 1.0
@@ -381,7 +399,7 @@ def _build_forecasts(
         # never an actionable market pick.
         status = quality_gate(
             station_known=True, rules_available=False, freshness=freshness,
-            agreement=source_agreement, interval_width_f=2 * half_width,
+            agreement=source_agreement, interval_width_f=interval_width,
         )
         if status is QualityStatus.UNKNOWN_SETTLEMENT_RULE or not is_calibrated or not complete_guidance:
             status = QualityStatus.NO_BET
@@ -395,6 +413,10 @@ def _build_forecasts(
                 "timezone": station.timezone,
                 "marketType": "daily_high",
                 "isCalibrated": is_calibrated,
+                "forecastLeadDays": lead_days,
+                "evaluatedLeadDays": SUPPORTED_FORECAST_LEAD_DAYS,
+                "supportedHorizon": supported_horizon,
+                "featureCompletenessPct": round(100 * completeness, 1),
                 "guidanceComplete": complete_guidance,
                 "requiredGuidanceModels": list(MODEL_SOURCES),
                 "sourceProvenance": {
@@ -419,12 +441,12 @@ def _build_forecasts(
                 # model's own per-station split-conformal half-width rather
                 # than a fixed placeholder, so the band reflects that
                 # station's real calibrated uncertainty for this forecast.
-                "rangeLowF": int(np.rint(high - half_width)),
-                "rangeHighF": int(np.rint(high + half_width)),
-                "fourDegreeRangeLowF": high - FOUR_DEGREE_HALF_WIDTH_F,
-                "fourDegreeRangeHighF": high + FOUR_DEGREE_HALF_WIDTH_F,
-                "uncertainty": "Low" if half_width <= 2.5 else "Moderate",
-                "modelRange": [round(float(prediction["p10_f"]), 1), round(float(prediction["p90_f"]), 1)] if prediction is not None else [round(predicted_high - half_width, 1), round(predicted_high + half_width, 1)],
+                "rangeLowF": int(np.rint(interval_lower + (high - predicted_high))) if interval_lower is not None else None,
+                "rangeHighF": int(np.rint(interval_upper + (high - predicted_high))) if interval_upper is not None else None,
+                "fourDegreeRangeLowF": high - FOUR_DEGREE_HALF_WIDTH_F if is_calibrated else None,
+                "fourDegreeRangeHighF": high + FOUR_DEGREE_HALF_WIDTH_F if is_calibrated else None,
+                "uncertainty": "Low" if half_width is not None and half_width <= 2.5 else ("Moderate" if half_width is not None else "Unavailable"),
+                "modelRange": [round(float(prediction["interval_lower_f"]), 1), round(float(prediction["interval_upper_f"]), 1)] if prediction is not None else None,
                 "observedHighSoFarF": observed_high_rounded,
                 "observedLowSoFarF": int(np.rint(observed_low)) if observed_low is not None else None,
                 "lastObservationAt": observation.get("lastSuccessfulObservationTime") if observation else None,
@@ -436,6 +458,8 @@ def _build_forecasts(
                     "Observed high has been incorporated as a floor." if observed_high is not None else None,
                     "Live NBM baseline shown; station-specific residual calibration is not yet available." if not is_calibrated else None,
                     "NO BET: complete NBM, HRRR, and GFS guidance is required for the evaluated residual-MOS contract." if not complete_guidance else None,
+                    f"NO BET: residual MOS is evaluated only at a {SUPPORTED_FORECAST_LEAD_DAYS}-day lead; this request is {lead_days} days." if not supported_horizon else None,
+                    f"NO BET: only {completeness:.0%} of the model's expected features are finite (minimum {MIN_PREDICTION_FEATURE_COMPLETENESS:.0%})." if not features_sufficient else None,
                     "NO BET: no provider-specific market settlement contract has been verified for this display." ,
                 ))),
                 "stabilityReason": stability_reason,
@@ -460,7 +484,7 @@ def _assemble_payload(target_date: date, forecasts: list[dict[str, Any]], model_
         "modelEvidence": _model_evidence(),
         "forecastInputs": "NCEP NBM + HRRR + GFS forecast guidance",
         "validationTarget": "Official NOAA/NCEI daily TMAX",
-        "evaluationContract": "9,839 held-out station-day forecasts across all 20 configured stations; archived 24-hour lead composite",
+        "evaluationContract": "10,279 held-out station-day forecasts across all 20 configured stations; archived 24-hour lead composite",
         "releaseStatus": "Experimental shadow monitoring — not operational guidance",
         "modelVersion": model_version,
         "stabilityPolicy": "Minor refresh changes under 2°F are held; observed highs can update today.",

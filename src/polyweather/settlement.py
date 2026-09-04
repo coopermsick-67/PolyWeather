@@ -256,7 +256,7 @@ def _calibration_table(scored: pd.DataFrame, bins: int = 10) -> list[dict[str, o
 def bucket_hit_rate(predictions: pd.DataFrame, contract: MarketContract) -> dict[str, object]:
     """Score a REAL bucket-hit-rate and calibration check for a verified contract.
 
-    `predictions` follows the shape of `artifacts/backtest_20_enhanced/rolling_predictions.parquet`
+    `predictions` follows the shape of `artifacts/backtest_v4/rolling_predictions.parquet`
     (columns `station`, `target_date`, `xgb_prediction_f`, `tmax_f`, `p10_f`, `p90_f`).
     Raises `ValueError` if `contract` is not verified -- there is no code
     path in this module that produces a `hit_rate` number from an unverified

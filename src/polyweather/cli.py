@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.metadata
 import json
+import platform
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -12,8 +14,16 @@ import joblib
 import pandas as pd
 
 from .backtest import run_rolling_backtest, write_backtest
-from .data import add_derived_forecast_features, build_training_table, fetch_live_forecast_features, write_training_table
-from .model import CONFORMAL_NOMINAL_COVERAGE, AdaptiveResidualForecaster, BlendedResidualForecaster, ResidualForecaster
+from .data import add_derived_forecast_features, build_training_table, fetch_live_forecast_features, has_complete_core_guidance, write_training_table
+from .model import (
+    CONFORMAL_NOMINAL_COVERAGE,
+    MIN_PREDICTION_FEATURE_COMPLETENESS,
+    SUPPORTED_FORECAST_LEAD_DAYS,
+    AdaptiveResidualForecaster,
+    BlendedResidualForecaster,
+    ResidualForecaster,
+    feature_completeness,
+)
 from .quality import write_quality_report
 from .reporting import build_backtest_charts, make_model_card
 from .settlement import illustrative_report_by_station
@@ -111,6 +121,10 @@ def command_train(args: argparse.Namespace) -> None:
         "stations": sorted(table.station.unique().tolist()),
         "conformal_nominal_coverage": CONFORMAL_NOMINAL_COVERAGE,
         "conformal_halfwidth_f": model.conformal_halfwidth_f,
+        "interval_lower_quantile": (1.0 - CONFORMAL_NOMINAL_COVERAGE) / 2.0,
+        "interval_upper_quantile": 1.0 - (1.0 - CONFORMAL_NOMINAL_COVERAGE) / 2.0,
+        "supported_forecast_lead_days": [SUPPORTED_FORECAST_LEAD_DAYS],
+        "minimum_prediction_feature_completeness": MIN_PREDICTION_FEATURE_COMPLETENESS,
         # The quantile level actually applied after self-correction for
         # undercoverage (see CONFORMAL_SAFETY_MARGIN) -- distinct from the
         # nominal coverage above, which never changes. Only ResidualForecaster
@@ -129,6 +143,14 @@ def command_train(args: argparse.Namespace) -> None:
         "issue_time_contract": "fixed 24h archived lead composite in backtest; current latest forecast at inference",
         "release_status": "SHADOW_ONLY until prospective fixed-cutoff logging and verification pass",
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
+        "artifact_format": "joblib-pickle; trusted local artifacts only",
+        "runtime_versions": {
+            "python": platform.python_version(),
+            "numpy": importlib.metadata.version("numpy"),
+            "pandas": importlib.metadata.version("pandas"),
+            "scikit-learn": importlib.metadata.version("scikit-learn"),
+            "xgboost": importlib.metadata.version("xgboost"),
+        },
     }
     (output_dir / "model_manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     print(json.dumps(manifest, indent=2))
@@ -145,19 +167,33 @@ def command_predict(args: argparse.Namespace) -> None:
     for icao in requested:
         station = require_station(icao)
         features = fetch_live_forecast_features(station, target_date)
-        forecast = model.predict(pd.DataFrame([features])).iloc[0].to_dict()
+        frame = pd.DataFrame([features])
+        completeness = float(feature_completeness(model, frame)[0])
+        lead_days = int(features.get("forecast_lead_days", -1))
+        calibrated = (
+            lead_days == SUPPORTED_FORECAST_LEAD_DAYS
+            and has_complete_core_guidance(features)
+            and completeness >= MIN_PREDICTION_FEATURE_COMPLETENESS
+        )
+        forecast = model.predict(frame).iloc[0].to_dict() if calibrated else None
+        point = float(forecast["prediction_f"]) if forecast is not None else float(features["nbm_baseline_f"])
         rows.append(
             {
                 "station": station.icao,
                 "name": station.name,
                 "target_date": str(target_date),
-                "forecast_tmax_f": round(float(forecast["prediction_f"]), 1),
-                "p10_f": round(float(forecast["p10_f"]), 1),
-                "p50_f": round(float(forecast["p50_f"]), 1),
-                "p90_f": round(float(forecast["p90_f"]), 1),
+                "forecast_tmax_f": round(point, 1),
+                "interval_lower_f": round(float(forecast["interval_lower_f"]), 1) if forecast is not None else None,
+                "interval_upper_f": round(float(forecast["interval_upper_f"]), 1) if forecast is not None else None,
+                "p10_f": round(float(forecast["p10_f"]), 1) if forecast is not None else None,
+                "p50_f": round(float(forecast["p50_f"]), 1) if forecast is not None else None,
+                "p90_f": round(float(forecast["p90_f"]), 1) if forecast is not None else None,
                 "nbm_baseline_f": round(float(features["nbm_baseline_f"]), 1),
-                "model": f"{model.kind.upper()} residual MOS",
-                "interval": "nominal 75% split-conformal interval",
+                "model": f"{model.kind.upper()} residual MOS" if calibrated else "raw live NBM fallback",
+                "is_calibrated": calibrated,
+                "forecast_lead_days": lead_days,
+                "feature_completeness": round(completeness, 3),
+                "interval": "nominal 80% split-conformal interval" if calibrated else None,
                 "generated_at_utc": datetime.now(timezone.utc).isoformat(),
             }
         )
@@ -295,7 +331,7 @@ def build_parser() -> argparse.ArgumentParser:
         "illustrative-bucket-hit-rate",
         help="Research-only: illustrative/UNVERIFIED bucket-hit-rate + calibration report (no real settlement contract).",
     )
-    illustrative_hit_rate.add_argument("--predictions", default="artifacts/backtest_20_enhanced/rolling_predictions.parquet")
+    illustrative_hit_rate.add_argument("--predictions", default="artifacts/backtest_v4/rolling_predictions.parquet")
     illustrative_hit_rate.add_argument("--output-dir", default="artifacts/settlement")
     illustrative_hit_rate.set_defaults(func=command_illustrative_bucket_hit_rate)
     return parser

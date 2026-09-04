@@ -41,30 +41,20 @@ CATEGORICAL_COLUMNS = ("station",)
 # self-corrects the quantile level at fit time using a nested split of the
 # calibration block alone -- see `_select_conformal_quantile_level`. This
 # constant is now only the search floor / fallback, never the final level.
-CONFORMAL_QUANTILE = 0.75
-CONFORMAL_QUANTILE_MAX = 0.95
+# ``p10``/``p90`` means an 80% central interval.  The previous 75% target
+# made those public field names mathematically false even when calibration
+# was perfect.  Keep the external names for compatibility, but calibrate the
+# contract they actually describe.
+CONFORMAL_QUANTILE = 0.80
+CONFORMAL_QUANTILE_MAX = 0.98
 CONFORMAL_NOMINAL_COVERAGE = CONFORMAL_QUANTILE
-# `_select_conformal_quantile_level`'s nested split only ever looks one
-# half-calibration-window ahead (the "check half" immediately follows the
-# "fit half", both inside the same trailing `calibration_days` block). A
-# synthetic drift experiment (residual scale trending upward over time, the
-# realistic case of a growing/heterogeneous station roster or a changing NBM
-# era) showed this myopia in practice: the nested check reported adequate
-# coverage using only the last ~30 days of evidence, then true future
-# coverage on genuinely held-out data 1-3 months later still landed several
-# points under the nominal target (as low as ~73% against a 75% target).
-# Requiring the nested check's lower-confidence-bound to clear the target
-# PLUS this fixed additive margin -- rather than the target alone --
-# compensates for that blind spot. Across repeated synthetic trials (no
-# drift, moderate drift, strong drift; see tests/test_model.py) a margin of
-# 0.04 reliably closed a ~3-4 point real undercoverage gap while only mildly
-# over-widening already-adequate (non-drifting) periods -- a predictable,
-# monotonic safety buffer rather than a noisy drift-detection heuristic (an
-# explicit trend-extrapolation approach was tried first and rejected: on the
-# same synthetic scenarios it was too noisy on a ~300-row half-split to
-# reliably distinguish real drift from sampling variance, sometimes adding
-# unnecessary width on stable data and sometimes missing real drift).
-CONFORMAL_SAFETY_MARGIN = 0.04
+# The nested drift check uses a small coverage cushion.  This is deliberately
+# modest: a finite-sample order statistic does the primary robustness work,
+# rather than a hand-tuned constant doing all of it.
+CONFORMAL_SAFETY_MARGIN = 0.02
+CONFORMAL_MIN_STATION_ROWS = 30
+SUPPORTED_FORECAST_LEAD_DAYS = 1
+MIN_PREDICTION_FEATURE_COMPLETENESS = 0.85
 # AdaptiveResidualForecaster station-model selection: a station only switches
 # away from XGB (the default) when its calibration window has at least this
 # many paired rows AND a paired one-sided Wilcoxon signed-rank test on the
@@ -100,6 +90,81 @@ NON_FEATURE_COLUMNS = {
     "source_vintage",
     "training_table_sha256",
 }
+
+
+def _validate_training_contract(frame: pd.DataFrame) -> None:
+    """Reject mixed/unsupported horizons instead of learning an undefined task."""
+    if "forecast_lead_days" in frame:
+        leads = set(pd.to_numeric(frame["forecast_lead_days"], errors="coerce").dropna().astype(int))
+        if leads and leads != {SUPPORTED_FORECAST_LEAD_DAYS}:
+            raise ValueError(
+                "Residual MOS is evaluated only for a 1-day forecast lead; "
+                f"received lead_days={sorted(leads)}. Train separate artifacts per horizon."
+            )
+
+
+def feature_completeness(model: Any, frame: pd.DataFrame) -> np.ndarray:
+    """Return the finite share of numeric features expected by a fitted model.
+
+    Composite forecasters expose their XGBoost member as the operational
+    feature contract.  This gives deployment code a deterministic way to
+    decline residual correction when an upstream response is only partially
+    populated, rather than silently leaning on median imputation.
+    """
+    member = getattr(model, "xgb", model)
+    columns = list(getattr(member, "numeric_columns", []))
+    if not columns:
+        return np.zeros(len(frame), dtype=float)
+    values = pd.DataFrame(
+        {
+            column: pd.to_numeric(frame[column], errors="coerce")
+            if column in frame
+            else pd.Series(np.nan, index=frame.index)
+            for column in columns
+        },
+        index=frame.index,
+    )
+    return np.isfinite(values.to_numpy(float)).mean(axis=1)
+
+
+def _finite_sample_quantile(values: np.ndarray | pd.Series, probability: float) -> float:
+    """Conservative finite-sample order statistic used by split conformal.
+
+    Linear interpolation can return a threshold smaller than every admissible
+    order statistic.  ``method='higher'`` plus the ``(n + 1)`` rank correction
+    avoids that finite-sample undercoverage bug.
+    """
+    clean = np.asarray(values, dtype=float)
+    clean = clean[np.isfinite(clean)]
+    if clean.size == 0:
+        raise ValueError("Cannot calibrate an interval from zero finite residuals.")
+    rank = min(clean.size, max(1, int(np.ceil((clean.size + 1) * probability))))
+    return float(np.sort(clean)[rank - 1])
+
+
+def _finite_sample_lower_quantile(values: np.ndarray | pd.Series, probability: float) -> float:
+    """Lower-tail companion using the outward finite-sample order statistic."""
+    clean = np.asarray(values, dtype=float)
+    clean = clean[np.isfinite(clean)]
+    if clean.size == 0:
+        raise ValueError("Cannot calibrate an interval from zero finite residuals.")
+    rank = min(clean.size, max(1, int(np.floor((clean.size + 1) * probability))))
+    return float(np.sort(clean)[rank - 1])
+
+
+def _robust_tail_bounds(
+    ordered_centered_residuals: np.ndarray | pd.Series,
+    coverage: float,
+) -> tuple[float, float]:
+    """Return leakage-free asymmetric finite-sample residual bounds."""
+    clean = np.asarray(ordered_centered_residuals, dtype=float)
+    clean = clean[np.isfinite(clean)]
+    if clean.size == 0:
+        raise ValueError("Cannot calibrate an interval from zero finite residuals.")
+    tail = (1.0 - coverage) / 2.0
+    lower = _finite_sample_lower_quantile(clean, tail)
+    upper = _finite_sample_quantile(clean, 1.0 - tail)
+    return float(lower), float(upper)
 
 
 def select_feature_columns(frame: pd.DataFrame) -> tuple[list[str], list[str]]:
@@ -202,7 +267,7 @@ def _select_conformal_quantile_level(
     required_coverage = target_coverage + safety_margin
     level = base_quantile
     while level <= max_quantile + 1e-9:
-        threshold = float(np.nanquantile(fit_half, level))
+        threshold = _finite_sample_quantile(fit_half, level)
         covered = float(np.mean(check_half <= threshold))
         covered_lower_bound = covered - z * np.sqrt(max(covered * (1.0 - covered), 0.0) / check_n)
         if covered_lower_bound >= required_coverage:
@@ -255,6 +320,14 @@ class ResidualForecaster:
     calibration_offset_by_station_f: dict[str, float]
     calibration_rows: int
     train_rows: int
+    conformal_lower_residual_f: float
+    conformal_upper_residual_f: float
+    conformal_lower_by_station_f: dict[str, float]
+    conformal_upper_by_station_f: dict[str, float]
+    p10_residual_f: float
+    p90_residual_f: float
+    p10_by_station_f: dict[str, float]
+    p90_by_station_f: dict[str, float]
     # The quantile level actually applied after `_select_conformal_quantile_level`
     # self-corrects for undercoverage -- distinct from CONFORMAL_QUANTILE (the
     # search floor). Kept on the object (and surfaced in the model manifest)
@@ -270,7 +343,10 @@ class ResidualForecaster:
         calibration_days: int = 60,
         random_state: int = 20260813,
     ) -> "ResidualForecaster":
+        _validate_training_contract(train)
         usable = train.dropna(subset=[TARGET_COLUMN, BASELINE_COLUMN]).copy()
+        usable["target_date"] = pd.to_datetime(usable["target_date"])
+        usable = usable.sort_values(["target_date", "station"], kind="stable")
         if len(usable) < 50:
             raise ValueError("At least 50 training rows with NBM baseline and Tmax labels are required.")
         categorical, numeric = select_feature_columns(usable)
@@ -323,10 +399,15 @@ class ResidualForecaster:
         # fitted against outcomes after the later backtest/test period.
         if calibration.empty:
             quantile_level = CONFORMAL_QUANTILE
-            halfwidth = float(
-                np.nanquantile(np.abs(usable[TARGET_COLUMN] - usable[BASELINE_COLUMN]), quantile_level)
-            )
+            raw_residual = (usable[TARGET_COLUMN] - usable[BASELINE_COLUMN]).to_numpy(float)
+            lower_residual, upper_residual = _robust_tail_bounds(raw_residual, quantile_level)
+            p10_residual, p90_residual = lower_residual, upper_residual
+            halfwidth = max(abs(lower_residual), abs(upper_residual))
             halfwidth_by_station: dict[str, float] = {}
+            lower_by_station: dict[str, float] = {}
+            upper_by_station: dict[str, float] = {}
+            p10_by_station: dict[str, float] = {}
+            p90_by_station: dict[str, float] = {}
             calibration_offset = 0.0
             calibration_offset_by_station: dict[str, float] = {}
             final_pipeline = make_pipeline()
@@ -355,6 +436,7 @@ class ResidualForecaster:
                 if len(group) >= 10
             }
             centered = residual_frame["residual"] - residual_frame["station"].map(calibration_offset_by_station).fillna(calibration_offset)
+            residual_frame["centered"] = centered
             residual_frame["centered_abs"] = centered.abs()
             # Determine the effective quantile level from calibration data
             # alone (nested split, no test-fold rows involved) so the
@@ -363,12 +445,31 @@ class ResidualForecaster:
             quantile_level = _select_conformal_quantile_level(
                 global_ordered, CONFORMAL_QUANTILE, CONFORMAL_NOMINAL_COVERAGE
             )
-            halfwidth = float(np.nanquantile(residual_frame["centered_abs"], quantile_level))
-            halfwidth_by_station = {
-                str(station): float(np.nanquantile(group["centered_abs"], quantile_level))
-                for station, group in residual_frame.groupby("station")
-                if str(station) in calibration_offset_by_station and len(group) >= 20
-            }
+            ordered_centered = residual_frame.sort_values("target_date")["centered"].to_numpy(float)
+            lower_residual, upper_residual = _robust_tail_bounds(ordered_centered, quantile_level)
+            p10_residual, p90_residual = _robust_tail_bounds(
+                ordered_centered, CONFORMAL_NOMINAL_COVERAGE
+            )
+            halfwidth = max(abs(lower_residual), abs(upper_residual))
+            lower_by_station = {}
+            upper_by_station = {}
+            p10_by_station = {}
+            p90_by_station = {}
+            halfwidth_by_station = {}
+            for station, group in residual_frame.groupby("station", sort=True):
+                station_key = str(station)
+                if station_key not in calibration_offset_by_station or len(group) < CONFORMAL_MIN_STATION_ROWS:
+                    continue
+                station_ordered = group.sort_values("target_date")["centered"].to_numpy(float)
+                station_lower, station_upper = _robust_tail_bounds(station_ordered, quantile_level)
+                station_p10, station_p90 = _robust_tail_bounds(
+                    station_ordered, CONFORMAL_NOMINAL_COVERAGE
+                )
+                lower_by_station[station_key] = station_lower
+                upper_by_station[station_key] = station_upper
+                p10_by_station[station_key] = station_p10
+                p90_by_station[station_key] = station_p90
+                halfwidth_by_station[station_key] = max(abs(station_lower), abs(station_upper))
             # The calibration block is held apart from model fitting. That
             # gives the residual offset and interval the same time direction
             # as the test / future forecast, rather than reusing fitted rows.
@@ -385,11 +486,19 @@ class ResidualForecaster:
             calibration_offset_by_station_f=calibration_offset_by_station,
             calibration_rows=int(len(calibration)),
             train_rows=int(fitted_rows),
+            conformal_lower_residual_f=float(lower_residual),
+            conformal_upper_residual_f=float(upper_residual),
+            conformal_lower_by_station_f=lower_by_station,
+            conformal_upper_by_station_f=upper_by_station,
+            p10_residual_f=float(p10_residual),
+            p90_residual_f=float(p90_residual),
+            p10_by_station_f=p10_by_station,
+            p90_by_station_f=p90_by_station,
             conformal_quantile_level=quantile_level,
         )
 
     def predict(self, data: pd.DataFrame) -> pd.DataFrame:
-        """Return calibrated deterministic and nominal-75% interval forecasts."""
+        """Return calibrated deterministic and nominal-80% interval forecasts."""
         if BASELINE_COLUMN not in data:
             raise ValueError(f"Prediction data must contain {BASELINE_COLUMN}.")
         baseline = pd.to_numeric(data[BASELINE_COLUMN], errors="coerce").to_numpy(float)
@@ -400,11 +509,27 @@ class ResidualForecaster:
         offsets = stations.map(self.calibration_offset_by_station_f).fillna(self.calibration_offset_f).to_numpy(float)
         halfwidths = stations.map(self.conformal_halfwidth_by_station_f).fillna(self.conformal_halfwidth_f).to_numpy(float)
         prediction = baseline + residual + offsets
+        lower_global = getattr(self, "conformal_lower_residual_f", -self.conformal_halfwidth_f)
+        upper_global = getattr(self, "conformal_upper_residual_f", self.conformal_halfwidth_f)
+        lower_by_station = getattr(self, "conformal_lower_by_station_f", {})
+        upper_by_station = getattr(self, "conformal_upper_by_station_f", {})
+        lower_adjustment = stations.map(lower_by_station).fillna(lower_global).to_numpy(float)
+        upper_adjustment = stations.map(upper_by_station).fillna(upper_global).to_numpy(float)
+        interval_lower = prediction + lower_adjustment
+        interval_upper = prediction + upper_adjustment
+        p10_global = getattr(self, "p10_residual_f", lower_global)
+        p90_global = getattr(self, "p90_residual_f", upper_global)
+        p10_by_station = getattr(self, "p10_by_station_f", {})
+        p90_by_station = getattr(self, "p90_by_station_f", {})
+        p10 = prediction + stations.map(p10_by_station).fillna(p10_global).to_numpy(float)
+        p90 = prediction + stations.map(p90_by_station).fillna(p90_global).to_numpy(float)
         result = pd.DataFrame(index=data.index)
         result["prediction_f"] = prediction
-        result["p10_f"] = prediction - halfwidths
+        result["interval_lower_f"] = interval_lower
+        result["interval_upper_f"] = interval_upper
+        result["p10_f"] = p10
         result["p50_f"] = prediction
-        result["p90_f"] = prediction + halfwidths
+        result["p90_f"] = p90
         result["conformal_halfwidth_f"] = halfwidths
         result["calibration_offset_f"] = offsets
         return result
@@ -620,15 +745,26 @@ class BlendedResidualForecaster:
         stations = data["station"].astype(str) if "station" in data else pd.Series("", index=data.index)
         weight = stations.map(self.station_ridge_weights).fillna(0.0).to_numpy(float)
         prediction = weight * ridge_output["prediction_f"].to_numpy(float) + (1.0 - weight) * xgb_output["prediction_f"].to_numpy(float)
-        halfwidth = np.maximum(
-            ridge_output["conformal_halfwidth_f"].to_numpy(float),
-            xgb_output["conformal_halfwidth_f"].to_numpy(float),
-        )
+        ridge_lower_adjustment = ridge_output["interval_lower_f"].to_numpy(float) - ridge_output["prediction_f"].to_numpy(float)
+        xgb_lower_adjustment = xgb_output["interval_lower_f"].to_numpy(float) - xgb_output["prediction_f"].to_numpy(float)
+        ridge_upper_adjustment = ridge_output["interval_upper_f"].to_numpy(float) - ridge_output["prediction_f"].to_numpy(float)
+        xgb_upper_adjustment = xgb_output["interval_upper_f"].to_numpy(float) - xgb_output["prediction_f"].to_numpy(float)
+        interval_lower = prediction + np.minimum(ridge_lower_adjustment, xgb_lower_adjustment)
+        interval_upper = prediction + np.maximum(ridge_upper_adjustment, xgb_upper_adjustment)
+        ridge_p10_adjustment = ridge_output["p10_f"].to_numpy(float) - ridge_output["prediction_f"].to_numpy(float)
+        xgb_p10_adjustment = xgb_output["p10_f"].to_numpy(float) - xgb_output["prediction_f"].to_numpy(float)
+        ridge_p90_adjustment = ridge_output["p90_f"].to_numpy(float) - ridge_output["prediction_f"].to_numpy(float)
+        xgb_p90_adjustment = xgb_output["p90_f"].to_numpy(float) - xgb_output["prediction_f"].to_numpy(float)
+        p10 = prediction + weight * ridge_p10_adjustment + (1.0 - weight) * xgb_p10_adjustment
+        p90 = prediction + weight * ridge_p90_adjustment + (1.0 - weight) * xgb_p90_adjustment
+        halfwidth = np.maximum(prediction - interval_lower, interval_upper - prediction)
         result = pd.DataFrame(index=data.index)
         result["prediction_f"] = prediction
-        result["p10_f"] = prediction - halfwidth
+        result["interval_lower_f"] = interval_lower
+        result["interval_upper_f"] = interval_upper
+        result["p10_f"] = p10
         result["p50_f"] = prediction
-        result["p90_f"] = prediction + halfwidth
+        result["p90_f"] = p90
         result["conformal_halfwidth_f"] = halfwidth
         result["calibration_offset_f"] = weight * ridge_output["calibration_offset_f"].to_numpy(float) + (1.0 - weight) * xgb_output["calibration_offset_f"].to_numpy(float)
         return result

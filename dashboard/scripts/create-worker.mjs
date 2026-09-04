@@ -132,17 +132,20 @@ function directGuidanceForecast(station, targetDate, item) {
     station: station.stationId,
     city: station.name,
     marketLocation: station.display_name,
+    settlementNote: station.display_note,
+    timezone: station.timezone,
+    marketType: 'daily_high',
     targetDate,
     highF: high,
     rawModelHighF: high,
     baselineHighF: high,
     modelDeltaF: 0,
-    rangeLowF: high - 4,
-    rangeHighF: high + 4,
-    fourDegreeRangeLowF: high - 2,
-    fourDegreeRangeHighF: high + 2,
-    modelRange: [high - 4, high + 4],
-    uncertainty: 'High',
+    rangeLowF: null,
+    rangeHighF: null,
+    fourDegreeRangeLowF: null,
+    fourDegreeRangeHighF: null,
+    modelRange: null,
+    uncertainty: 'Unavailable',
     isCalibrated: false,
     currentObservedTemperatureF: null,
     observedHighSoFarF: null,
@@ -151,7 +154,9 @@ function directGuidanceForecast(station, targetDate, item) {
     lastObservationAt: null,
     dataFreshness: null,
     sourceAgreement: null,
+    modelSpreadF: null,
     sourceCount: 1,
+    sourceName: 'Live NCEP NBM via Open-Meteo',
     dataQualityStatus: 'DIRECT_GUIDANCE_FALLBACK',
     reasonCodes: ['Live NCEP NBM daily guidance via Open-Meteo. The calibrated forecast service is unavailable, so residual MOS and observed-high adjustments are deliberately disabled.'],
     stabilityReason: 'direct_guidance_fallback',
@@ -270,17 +275,18 @@ async function nwsStationForecast(station, targetDate, today) {
     station: station.stationId,
     city: station.name,
     marketLocation: station.display_name,
+    settlementNote: station.display_note,
     timezone: station.timezone,
     targetDate,
     highF: high,
     rawModelHighF: nwsHigh,
     baselineHighF: nwsHigh,
     modelDeltaF: high - nwsHigh,
-    rangeLowF: high - 3,
-    rangeHighF: high + 3,
-    fourDegreeRangeLowF: high - 2,
-    fourDegreeRangeHighF: high + 2,
-    modelRange: [high - 3, high + 3],
+    rangeLowF: null,
+    rangeHighF: null,
+    fourDegreeRangeLowF: null,
+    fourDegreeRangeHighF: null,
+    modelRange: null,
     uncertainty: 'Unavailable',
     isCalibrated: false,
     currentObservedTemperatureF: latest ? Math.round(latest.temperatureF * 10) / 10 : null,
@@ -330,43 +336,24 @@ async function nwsLiveDashboard(targetDate) {
   };
 }
 
-// The browser also has this fallback, but the Worker must provide it itself.
-// A hosted request can fail before the client gets a usable JSON payload (for
-// example when the upstream forecast model is temporarily unavailable from a
-// Cloudflare isolate). Returning a labeled reference board here keeps the
-// dashboard's charts, station cards, and date controls functional instead of
-// replacing the whole page with an API error.
+// If every live source is unavailable, fail visibly.  A stale packaged
+// temperature can look like a real prediction even with a warning beside it.
 function packagedSnapshotDashboard(targetDate) {
   const now = new Date();
   const today = localDate(now, 'America/New_York');
   const resolvedDate = targetDateForRequest(targetDate, today, earliestStationLocalToday(now, snapshot.stationRegistry));
-  const forecasts = (snapshot.forecasts ?? []).map((forecast) => ({
-    ...forecast,
-    targetDate: resolvedDate,
-    isCalibrated: false,
-    currentObservedTemperatureF: null,
-    observedHighSoFarF: null,
-    observedLowSoFarF: null,
-    intradayObservations: [],
-    lastObservationAt: null,
-    dataFreshness: null,
-    sourceAgreement: null,
-    dataQualityStatus: 'PACKAGED_SNAPSHOT_FALLBACK',
-    reasonCodes: ['Live forecast guidance is temporarily unavailable. These are packaged reference values retained so the dashboard remains usable.'],
-    stabilityReason: 'packaged_snapshot_fallback',
-  }));
   return {
     ...snapshot,
     today,
     targetDate: resolvedDate,
     maxDate: addDays(today, 7),
-    generatedAt: snapshot.generatedAt,
-    forecasts,
-    unavailableStations: [],
+    generatedAt: null,
+    forecasts: [],
+    unavailableStations: snapshot.stationRegistry.map((station) => station.stationId),
     marketForecast: false,
-    forecastInputs: 'Packaged reference values; live guidance is unavailable.',
-    modelStatus: 'PACKAGED_SNAPSHOT_FALLBACK: these values are not a live forecast.',
-    releaseStatus: 'Live forecast refresh is unavailable. Do not use this fallback for a weather pick.',
+    forecastInputs: 'Live guidance is unavailable; no cached temperatures are substituted.',
+    modelStatus: 'LIVE_DATA_UNAVAILABLE',
+    releaseStatus: 'Live forecast refresh is unavailable. No stale or synthetic forecast values are displayed.',
   };
 }
 

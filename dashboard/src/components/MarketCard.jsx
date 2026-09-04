@@ -10,6 +10,7 @@ export default function MarketCard({ registry = [], selectedStation, forecast, o
   const station = registry.find((item) => item.stationId === selectedStation) ?? registry[0]
   if (!station) return null
   const hasForecast = Boolean(forecast)
+  const hasBand = Number.isFinite(forecast?.rangeLowF) && Number.isFinite(forecast?.rangeHighF)
   const hasSpread = Number.isFinite(forecast?.modelSpreadF)
   return <section className="market-card" aria-labelledby="market-card-title">
     <div className="market-card-head">
@@ -18,7 +19,7 @@ export default function MarketCard({ registry = [], selectedStation, forecast, o
     </div>
     <div className="settlement-warning"><AlertTriangle size={16} /><span><strong>Settlement station:</strong> {station.display_note}. Never substitute a city-center or similarly named airport.</span></div>
     <div className="market-metrics">
-      <div className="market-estimate"><span>Daily high estimate</span><strong>{hasForecast ? `${forecast.highF}°F` : '—'}</strong><small>{hasForecast ? `${forecast.rangeLowF}°–${forecast.rangeHighF}° displayed uncertainty band` : 'No calibrated model is available yet.'}</small></div>
+      <div className="market-estimate"><span>Daily high estimate</span><strong>{hasForecast ? `${forecast.highF}°F` : '—'}</strong><small>{hasBand ? `${forecast.rangeLowF}°–${forecast.rangeHighF}° calibrated interval` : hasForecast ? 'Live baseline shown; calibrated uncertainty is unavailable.' : 'No calibrated model is available yet.'}</small></div>
       <div><span>Current observation</span><strong>{forecast?.currentObservedTemperatureF ?? '—'}{forecast?.currentObservedTemperatureF != null ? '°F' : ''}</strong><small>{forecast?.lastObservationAt ? `Updated ${stationTime(forecast.lastObservationAt, station.timezone)} ${station.timezone}` : 'No live observation loaded'}</small></div>
       <div><span>Live model spread</span><strong>{hasSpread ? `${forecast.modelSpreadF.toFixed(1)}°F` : '—'}</strong><small>{hasSpread ? 'Difference across available model highs; not a probability.' : forecast?.sourceName ?? 'Awaiting source details.'}</small></div>
       <div><span>Data-quality status</span><strong className={`market-status ${statusClass(forecast?.dataQualityStatus)}`}>{forecast?.dataQualityStatus ?? 'NO BET / INSUFFICIENT DATA'}</strong><small>{hasForecast ? (forecast.isCalibrated ? 'Historical score exists; no market contract or executable price is verified.' : 'Guidance shown without historical residual validation.') : 'Configured station; not trained or rule-linked.'}</small></div>

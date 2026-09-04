@@ -11,7 +11,14 @@ import numpy as np
 import pandas as pd
 
 from .metrics import forecast_metrics, interval_metrics, relative_mae_skill
-from .model import BASELINE_COLUMN, TARGET_COLUMN, BlendedResidualForecaster, ResidualForecaster, SeasonalClimatology
+from .model import (
+    BASELINE_COLUMN,
+    CONFORMAL_NOMINAL_COVERAGE,
+    TARGET_COLUMN,
+    BlendedResidualForecaster,
+    ResidualForecaster,
+    SeasonalClimatology,
+)
 from .stations import STATIONS
 
 
@@ -50,8 +57,14 @@ def _metric_row(data: pd.DataFrame, forecast_column: str, label: str) -> dict[st
         output["mae_skill_vs_nbm"] = relative_mae_skill(data, TARGET_COLUMN, forecast_column, BASELINE_COLUMN)
     else:
         output["mae_skill_vs_nbm"] = 0.0
-    if forecast_column == "xgb_prediction_f":
-        output.update(interval_metrics(data))
+    interval_columns = {
+        "ridge_prediction_f": ("ridge_interval_lower_f", "ridge_interval_upper_f"),
+        "xgb_prediction_f": ("interval_lower_f", "interval_upper_f"),
+        "blend_prediction_f": ("blend_interval_lower_f", "blend_interval_upper_f"),
+    }
+    lower_upper = interval_columns.get(forecast_column)
+    if lower_upper and set(lower_upper).issubset(data.columns):
+        output.update(interval_metrics(data, lower=lower_upper[0], upper=lower_upper[1]))
     return output
 
 
@@ -88,19 +101,18 @@ def _acceptance(
     predictions: pd.DataFrame,
     by_station: pd.DataFrame,
     expected_stations: Iterable[str] | None = None,
+    bootstrap: pd.DataFrame | None = None,
 ) -> dict[str, object]:
-    # A challenger is retained only when its untouched-fold MAE actually
-    # improves on XGBoost. This prevents benchmark-only complexity from being
-    # silently promoted just because it clears a weaker baseline gate.
-    # The report's deployment gate is "beat unmodified NBM and linear MOS on
-    # untouched folds." A 1% global margin guards against a trivial numerical tie.
+    # XGBoost is predeclared as the production candidate. Choosing whichever
+    # challenger happened to win on these same scored folds would make the
+    # reported test set part of model selection and bias the result.
     overall_xgb = _metric_row(predictions, "xgb_prediction_f", "XGBoost residual")
     overall_blend = _metric_row(predictions, "blend_prediction_f", "Station blend residual")
     overall_ridge = _metric_row(predictions, "ridge_prediction_f", "Ridge residual")
-    champion_label = "Station blend residual" if overall_blend["mae_f"] < overall_xgb["mae_f"] else "XGBoost residual"
-    champion_column = "blend_prediction_f" if champion_label == "Station blend residual" else "xgb_prediction_f"
-    champion = overall_blend if champion_label == "Station blend residual" else overall_xgb
-    total = by_station.loc[by_station["model"] == champion_label].copy()
+    candidate_label = "XGBoost residual"
+    candidate_column = "xgb_prediction_f"
+    candidate = overall_xgb
+    total = by_station.loc[by_station["model"] == candidate_label].copy()
     expected = {str(station).upper() for station in (expected_stations if expected_stations is not None else STATIONS)}
     evaluated = {str(station).upper() for station in total["station"].unique()}
     missing_stations = sorted(expected - evaluated)
@@ -108,12 +120,35 @@ def _acceptance(
         total["station"].astype(str).str.upper().isin(expected) & (total["mae_skill_vs_nbm"] > 0), "station"
     ].nunique()
     margin = 0.01
-    condition_nbm = bool(champion["mae_skill_vs_nbm"] >= margin)
-    condition_ridge = bool(champion["mae_f"] < overall_ridge["mae_f"])
+    condition_nbm = bool(candidate["mae_skill_vs_nbm"] >= margin)
+    condition_ridge = bool(candidate["mae_f"] < overall_ridge["mae_f"])
     # A 20-city release cannot pass because a small subset performed well.
     # Every configured station must be evaluated and beat raw NBM.
     condition_stations = bool(not missing_stations and station_wins >= len(expected))
-    statistical_candidate = bool(condition_nbm and condition_ridge and condition_stations)
+    coverage_floor = CONFORMAL_NOMINAL_COVERAGE - 0.02
+    severe_station_coverage_floor = CONFORMAL_NOMINAL_COVERAGE - 0.05
+    overall_coverage = float(candidate.get("coverage", np.nan))
+    condition_interval = bool(np.isfinite(overall_coverage) and overall_coverage >= coverage_floor)
+    station_coverage = pd.to_numeric(total.get("coverage", pd.Series(dtype=float)), errors="coerce")
+    condition_station_intervals = bool(
+        len(station_coverage) == len(expected)
+        and station_coverage.notna().all()
+        and (station_coverage >= severe_station_coverage_floor).all()
+    )
+    bootstrap_skill_low = np.nan
+    if bootstrap is not None and not bootstrap.empty:
+        bootstrap_row = bootstrap.loc[bootstrap["model"].eq(candidate_label)]
+        if not bootstrap_row.empty:
+            bootstrap_skill_low = float(bootstrap_row.iloc[0]["skill_ci_low"])
+    condition_bootstrap = bool(np.isfinite(bootstrap_skill_low) and bootstrap_skill_low > 0)
+    statistical_candidate = bool(
+        condition_nbm
+        and condition_ridge
+        and condition_stations
+        and condition_interval
+        and condition_station_intervals
+        and condition_bootstrap
+    )
     return {
         # Statistical skill is necessary but not sufficient. The project's
         # present archived source reconstructs every hourly value at a fixed
@@ -126,10 +161,17 @@ def _acceptance(
         "xgb_mae_f": overall_xgb["mae_f"],
         "blend_mae_skill_vs_nbm": overall_blend["mae_skill_vs_nbm"],
         "blend_mae_f": overall_blend["mae_f"],
-        "candidate_model": champion_label,
-        "candidate_prediction_column": champion_column,
-        "candidate_mae_f": champion["mae_f"],
-        "candidate_mae_skill_vs_nbm": champion["mae_skill_vs_nbm"],
+        "candidate_model": candidate_label,
+        "candidate_prediction_column": candidate_column,
+        "candidate_mae_f": candidate["mae_f"],
+        "candidate_mae_skill_vs_nbm": candidate["mae_skill_vs_nbm"],
+        "candidate_coverage": overall_coverage,
+        "required_overall_coverage": coverage_floor,
+        "required_min_station_coverage": severe_station_coverage_floor,
+        "interval_gate_passed": condition_interval,
+        "station_interval_gate_passed": condition_station_intervals,
+        "bootstrap_skill_ci_low": bootstrap_skill_low,
+        "bootstrap_skill_gate_passed": condition_bootstrap,
         "ridge_mae_f": overall_ridge["mae_f"],
         "station_wins_vs_nbm": int(station_wins),
         "required_station_wins": len(expected),
@@ -176,16 +218,27 @@ def run_rolling_backtest(
         ridge = ResidualForecaster.fit(train, "ridge", calibration_days=calibration_days)
         xgb = ResidualForecaster.fit(train, "xgb", calibration_days=calibration_days)
         blend = BlendedResidualForecaster.fit(train, calibration_days=calibration_days)
-        ridge_output = ridge.predict(test).rename(columns={"prediction_f": "ridge_prediction_f"})
+        ridge_output = ridge.predict(test).rename(
+            columns={
+                "prediction_f": "ridge_prediction_f",
+                "interval_lower_f": "ridge_interval_lower_f",
+                "interval_upper_f": "ridge_interval_upper_f",
+            }
+        )
         xgb_output = xgb.predict(test).rename(columns={"prediction_f": "xgb_prediction_f"})
-        blend_output = blend.predict(test).rename(columns={"prediction_f": "blend_prediction_f"})
-        # Do not duplicate p10/p50/p90 from Ridge; the production candidate is XGB.
+        blend_output = blend.predict(test).rename(
+            columns={
+                "prediction_f": "blend_prediction_f",
+                "interval_lower_f": "blend_interval_lower_f",
+                "interval_upper_f": "blend_interval_upper_f",
+            }
+        )
         test = pd.concat(
             [
                 test.reset_index(drop=True),
-                ridge_output[["ridge_prediction_f"]].reset_index(drop=True),
+                ridge_output[["ridge_prediction_f", "ridge_interval_lower_f", "ridge_interval_upper_f"]].reset_index(drop=True),
                 xgb_output.reset_index(drop=True),
-                blend_output[["blend_prediction_f"]].reset_index(drop=True),
+                blend_output[["blend_prediction_f", "blend_interval_lower_f", "blend_interval_upper_f"]].reset_index(drop=True),
             ],
             axis=1,
         )
@@ -226,7 +279,7 @@ def run_rolling_backtest(
         by_station=by_station,
         by_month=by_month,
         bootstrap=bootstrap,
-        acceptance=_acceptance(result, by_station, expected_stations=expected_stations),
+        acceptance=_acceptance(result, by_station, expected_stations=expected_stations, bootstrap=bootstrap),
     )
 
 
