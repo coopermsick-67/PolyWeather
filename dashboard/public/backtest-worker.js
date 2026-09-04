@@ -52,7 +52,13 @@ async function runBacktest({ payload, station, startDate, endDate, models, runId
     await new Promise((resolve) => setTimeout(resolve, 0))
   }
   const candidate = summaries.find((summary) => summary.key === 'xgb') ?? summaries[0]
+  // A line chart has one continuous time axis. Never interleave different
+  // cities (their different climates create the misleading zig-zag shown in
+  // the old all-city chart). Aggregate scores remain all-city; the visual
+  // drill-down uses one deterministic station.
+  const chartStation = station === 'all' ? [...new Set(sourceRows.map((row) => row.station))].sort()[0] : station
   const chartRows = sourceRows
+    .filter((row) => row.station === chartStation)
     .filter((row) => candidate && finite(row.observedF) && finite(row[MODELS[candidate.key].field]))
     .sort((left, right) => left.date.localeCompare(right.date))
   const step = Math.max(1, Math.ceil(chartRows.length / 72))
@@ -69,6 +75,7 @@ async function runBacktest({ payload, station, startDate, endDate, models, runId
       dateRange: { start: startDate, end: endDate },
       summaries,
       candidateKey: candidate?.key ?? null,
+      chartStation,
       chartRows: displayRows,
       recentRows: chartRows.slice(-12).reverse(),
       decision: payload.decision,

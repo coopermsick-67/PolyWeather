@@ -148,14 +148,28 @@ async function directNbmDashboard(targetDate) {
   const today = localDate(now, 'America/New_York');
   const resolvedDate = targetDateForRequest(targetDate, today, earliestStationLocalToday(now, snapshot.stationRegistry));
   let response;
+  let payload;
   try {
     response = await fetchWithTimeout(directNbmEndpoint(snapshot.stationRegistry), { headers: { Accept: 'application/json' } }, 15_000);
+    if (response.ok) payload = await response.json().catch(() => null);
   } catch (error) {
-    throw new Error('Both calibrated and direct forecast services are unreachable: ' + (error.message || 'network error'));
+    console.warn('Bulk NBM fetch failed; retrying each station.', error.message || error);
   }
-  if (!response.ok) throw new Error('Direct NCEP NBM guidance returned ' + response.status + '.');
-  const payload = await response.json().catch(() => null);
-  const stations = Array.isArray(payload) ? payload : [payload];
+  // Open-Meteo occasionally rejects a multi-location request at the edge.
+  // Retry independent station requests, and only then use best_match as a
+  // clearly labeled availability fallback. One city must not blank all 20.
+  let stations = Array.isArray(payload) ? payload : [payload];
+  if (!payload || stations.length !== snapshot.stationRegistry.length) {
+    stations = await Promise.all(snapshot.stationRegistry.map(async (station) => {
+      const requestFor = async (model) => {
+        const endpoint = directNbmEndpoint([station]);
+        endpoint.searchParams.set('models', model);
+        const point = await fetchWithTimeout(endpoint, { headers: { Accept: 'application/json' } }, 8_000);
+        return point.ok ? point.json() : null;
+      };
+      try { return await requestFor('ncep_nbm_conus') || await requestFor('best_match'); } catch { return null; }
+    }));
+  }
   const forecasts = snapshot.stationRegistry.map((station, index) => directGuidanceForecast(station, resolvedDate, stations[index])).filter(Boolean);
   if (!forecasts.length) throw new Error('Direct NCEP NBM guidance returned no usable daily highs.');
   const available = new Set(forecasts.map((forecast) => forecast.station));
