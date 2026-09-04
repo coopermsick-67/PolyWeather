@@ -44,6 +44,27 @@ CATEGORICAL_COLUMNS = ("station",)
 CONFORMAL_QUANTILE = 0.75
 CONFORMAL_QUANTILE_MAX = 0.95
 CONFORMAL_NOMINAL_COVERAGE = CONFORMAL_QUANTILE
+# `_select_conformal_quantile_level`'s nested split only ever looks one
+# half-calibration-window ahead (the "check half" immediately follows the
+# "fit half", both inside the same trailing `calibration_days` block). A
+# synthetic drift experiment (residual scale trending upward over time, the
+# realistic case of a growing/heterogeneous station roster or a changing NBM
+# era) showed this myopia in practice: the nested check reported adequate
+# coverage using only the last ~30 days of evidence, then true future
+# coverage on genuinely held-out data 1-3 months later still landed several
+# points under the nominal target (as low as ~73% against a 75% target).
+# Requiring the nested check's lower-confidence-bound to clear the target
+# PLUS this fixed additive margin -- rather than the target alone --
+# compensates for that blind spot. Across repeated synthetic trials (no
+# drift, moderate drift, strong drift; see tests/test_model.py) a margin of
+# 0.04 reliably closed a ~3-4 point real undercoverage gap while only mildly
+# over-widening already-adequate (non-drifting) periods -- a predictable,
+# monotonic safety buffer rather than a noisy drift-detection heuristic (an
+# explicit trend-extrapolation approach was tried first and rejected: on the
+# same synthetic scenarios it was too noisy on a ~300-row half-split to
+# reliably distinguish real drift from sampling variance, sometimes adding
+# unnecessary width on stable data and sometimes missing real drift).
+CONFORMAL_SAFETY_MARGIN = 0.04
 # AdaptiveResidualForecaster station-model selection: a station only switches
 # away from XGB (the default) when its calibration window has at least this
 # many paired rows AND a paired one-sided Wilcoxon signed-rank test on the
@@ -138,6 +159,7 @@ def _select_conformal_quantile_level(
     max_quantile: float = CONFORMAL_QUANTILE_MAX,
     min_split_rows: int = 40,
     step: float = 0.01,
+    safety_margin: float = CONFORMAL_SAFETY_MARGIN,
 ) -> float:
     """Self-correct the conformal quantile level using only calibration data.
 
@@ -162,6 +184,11 @@ def _select_conformal_quantile_level(
     purely from calibration-block rows -- it is a standard finite-sample
     safety margin on the internal check, not a peek at test-fold outcomes.
 
+    `safety_margin` adds a further fixed buffer on top of `target_coverage`
+    for that same acceptance test (see CONFORMAL_SAFETY_MARGIN for why: the
+    nested check only looks one half-calibration-window ahead and cannot see
+    drift that keeps building beyond it).
+
     `ordered_abs_residual` must already be sorted by ascending target_date.
     """
     n = len(ordered_abs_residual)
@@ -172,12 +199,13 @@ def _select_conformal_quantile_level(
     check_half = ordered_abs_residual[split:]
     check_n = len(check_half)
     z = 1.28
+    required_coverage = target_coverage + safety_margin
     level = base_quantile
     while level <= max_quantile + 1e-9:
         threshold = float(np.nanquantile(fit_half, level))
         covered = float(np.mean(check_half <= threshold))
         covered_lower_bound = covered - z * np.sqrt(max(covered * (1.0 - covered), 0.0) / check_n)
-        if covered_lower_bound >= target_coverage:
+        if covered_lower_bound >= required_coverage:
             return float(min(level, max_quantile))
         level += step
     return max_quantile
@@ -227,6 +255,12 @@ class ResidualForecaster:
     calibration_offset_by_station_f: dict[str, float]
     calibration_rows: int
     train_rows: int
+    # The quantile level actually applied after `_select_conformal_quantile_level`
+    # self-corrects for undercoverage -- distinct from CONFORMAL_QUANTILE (the
+    # search floor). Kept on the object (and surfaced in the model manifest)
+    # so monitoring can see whether/how much correction engaged, rather than
+    # that being invisible behind the fixed nominal-coverage label.
+    conformal_quantile_level: float = CONFORMAL_QUANTILE
 
     @classmethod
     def fit(
@@ -288,8 +322,9 @@ class ResidualForecaster:
         # Conformal calibration follows time order: its residuals are never
         # fitted against outcomes after the later backtest/test period.
         if calibration.empty:
+            quantile_level = CONFORMAL_QUANTILE
             halfwidth = float(
-                np.nanquantile(np.abs(usable[TARGET_COLUMN] - usable[BASELINE_COLUMN]), CONFORMAL_QUANTILE)
+                np.nanquantile(np.abs(usable[TARGET_COLUMN] - usable[BASELINE_COLUMN]), quantile_level)
             )
             halfwidth_by_station: dict[str, float] = {}
             calibration_offset = 0.0
@@ -350,6 +385,7 @@ class ResidualForecaster:
             calibration_offset_by_station_f=calibration_offset_by_station,
             calibration_rows=int(len(calibration)),
             train_rows=int(fitted_rows),
+            conformal_quantile_level=quantile_level,
         )
 
     def predict(self, data: pd.DataFrame) -> pd.DataFrame:
@@ -376,13 +412,22 @@ class ResidualForecaster:
 
 @dataclass
 class AdaptiveResidualForecaster:
-    """Choose the better residual family per station using a held-out calibration tail.
+    """Choose the better residual family per station using a held-out selection window.
 
-    The selector never sees the scored forecast date: Ridge and XGBoost are
-    each fitted before the trailing calibration window, then the lower-MAE
-    member for each station is chosen from that window. This keeps the useful
-    station-specific behavior (notably marine-influenced sites) without
-    selecting a model on the later target outcomes.
+    The selector never sees the scored forecast date, and -- as of this fix --
+    never sees the final calibration window either. Earlier, Ridge and XGBoost
+    were each fitted with their *own* `calibration_days` tail as their offset/
+    interval calibration block, and model selection was then scored on that
+    exact same tail. That double-dipping let a station's chosen model be
+    whichever one's own offset happened to fit that specific window best, not
+    whichever family generalizes better -- an optimistic selection bias, the
+    same failure mode `BlendedResidualForecaster` was already structured to
+    avoid with its separate `selection` window. This now mirrors that
+    structure: a selector Ridge/XGB pair is fit on data strictly before a
+    held-out `selection_days` window, compared only on that window, and only
+    the resulting per-station choice (not those selector models) is kept. The
+    final `ridge`/`xgb` members returned here are refit on all usable history
+    with their own independent calibration tail, exactly as before.
     """
 
     kind: Literal["adaptive"]
@@ -409,22 +454,26 @@ class AdaptiveResidualForecaster:
         cls,
         train: pd.DataFrame,
         calibration_days: int = 60,
+        selection_days: int = 45,
         random_state: int = 20260813,
     ) -> "AdaptiveResidualForecaster":
-        ridge = ResidualForecaster.fit(train, "ridge", calibration_days, random_state)
-        xgb = ResidualForecaster.fit(train, "xgb", calibration_days, random_state)
         usable = train.dropna(subset=[TARGET_COLUMN, BASELINE_COLUMN]).copy()
         dates = pd.to_datetime(usable["target_date"])
         calibration_start = dates.max() - pd.Timedelta(days=calibration_days - 1)
-        calibration = usable.loc[dates >= calibration_start].copy()
+        selection_end = calibration_start - pd.Timedelta(days=1)
+        selection_start = selection_end - pd.Timedelta(days=selection_days - 1)
+        selector_train = usable.loc[dates < selection_start].copy()
+        selection_window = usable.loc[(dates >= selection_start) & (dates <= selection_end)].copy()
         selection: dict[str, Literal["ridge", "xgb"]] = {}
         selection_mae: dict[str, dict[str, float]] = {}
-        if calibration.empty:
+        if len(selector_train) < 50 or len(selection_window) < 30:
             selection = {str(station): "xgb" for station in usable["station"].unique()}
         else:
-            ridge_prediction = ridge.predict(calibration)["prediction_f"].to_numpy(float)
-            xgb_prediction = xgb.predict(calibration)["prediction_f"].to_numpy(float)
-            scored = calibration[["station", TARGET_COLUMN]].copy()
+            selector_ridge = ResidualForecaster.fit(selector_train, "ridge", calibration_days, random_state)
+            selector_xgb = ResidualForecaster.fit(selector_train, "xgb", calibration_days, random_state)
+            ridge_prediction = selector_ridge.predict(selection_window)["prediction_f"].to_numpy(float)
+            xgb_prediction = selector_xgb.predict(selection_window)["prediction_f"].to_numpy(float)
+            scored = selection_window[["station", TARGET_COLUMN]].copy()
             scored["ridge_ae"] = np.abs(scored[TARGET_COLUMN].to_numpy(float) - ridge_prediction)
             scored["xgb_ae"] = np.abs(scored[TARGET_COLUMN].to_numpy(float) - xgb_prediction)
             for station, group in scored.groupby("station", sort=True):
@@ -439,7 +488,7 @@ class AdaptiveResidualForecaster:
                 if n >= ADAPTIVE_MIN_SELECTION_SAMPLES and ridge_mae < xgb_mae and wilcoxon is not None:
                     # diff > 0 where XGB's absolute error exceeds Ridge's;
                     # one-sided test for "Ridge's errors are stochastically
-                    # smaller", never using any row past the calibration tail.
+                    # smaller", never using any row past the selection window.
                     diff = xgb_ae - ridge_ae
                     if np.any(diff != 0):
                         try:
@@ -450,6 +499,13 @@ class AdaptiveResidualForecaster:
                         if p_value < ADAPTIVE_SELECTION_ALPHA:
                             chosen = "ridge"
                 selection[station_key] = chosen
+            for station in usable["station"].unique():
+                selection.setdefault(str(station), "xgb")
+        # Final component models are refit on all usable pre-forecast history,
+        # each with its own independent (later, non-overlapping) calibration
+        # tail -- unrelated to the selector models used only for the choice above.
+        ridge = ResidualForecaster.fit(usable, "ridge", calibration_days, random_state)
+        xgb = ResidualForecaster.fit(usable, "xgb", calibration_days, random_state)
         return cls(
             kind="adaptive",
             ridge=ridge,

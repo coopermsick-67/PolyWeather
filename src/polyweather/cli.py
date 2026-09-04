@@ -111,6 +111,15 @@ def command_train(args: argparse.Namespace) -> None:
         "stations": sorted(table.station.unique().tolist()),
         "conformal_nominal_coverage": CONFORMAL_NOMINAL_COVERAGE,
         "conformal_halfwidth_f": model.conformal_halfwidth_f,
+        # The quantile level actually applied after self-correction for
+        # undercoverage (see CONFORMAL_SAFETY_MARGIN) -- distinct from the
+        # nominal coverage above, which never changes. Only ResidualForecaster
+        # carries this directly; adaptive/blend report their XGB member's
+        # level as a representative value since both members self-correct
+        # independently.
+        "conformal_quantile_level_applied": getattr(
+            model, "conformal_quantile_level", getattr(getattr(model, "xgb", None), "conformal_quantile_level", None)
+        ),
         "station_model_selection": getattr(model, "station_models", None),
         "station_ridge_weights": getattr(model, "station_ridge_weights", None),
         "selection_rows": getattr(model, "selection_rows", None),
