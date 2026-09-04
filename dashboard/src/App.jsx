@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   ArrowRight, BarChart3, Bell, CalendarDays, CheckCircle2, ChevronDown, ChevronRight,
-  CloudSun, Crown, Database, FileText, LockKeyhole, LogIn, Menu, Moon, RefreshCw, Settings, ShieldCheck, SunMedium, UserRound, X,
+  CloudSun, Database, FileText, Menu, Moon, RefreshCw, Settings, ShieldCheck, SunMedium, X,
 } from 'lucide-react'
-import { claimDailyPick, getDashboard, openBillingPortal, startCheckout } from './api'
+import { getDashboard } from './api'
 import { addDays, dateChoice, isoToday, longDate, shortDate } from './dateUtils'
 import ForecastBrief from './components/ForecastBrief'
 import ForecastControls from './components/ForecastControls'
@@ -28,7 +28,7 @@ function formatStationList(registry, limit = 8) {
 }
 
 function useRoute() {
-  const readRoute = () => ['forecast', 'backtest', 'account'].includes(window.location.hash.slice(2)) ? window.location.hash.slice(2) : 'home'
+  const readRoute = () => ['forecast', 'backtest'].includes(window.location.hash.slice(2)) ? window.location.hash.slice(2) : 'home'
   const [route, setRoute] = useState(readRoute)
   useEffect(() => {
     const change = () => setRoute(readRoute())
@@ -67,11 +67,10 @@ function WorkspaceNav({ route, theme, onThemeToggle }) {
     <a href="#/backtest"><Database size={19} /><span>Datasets</span></a>
     <a href="#/forecast"><Bell size={19} /><span>Alerts</span></a>
     <a href="#/accuracy"><FileText size={19} /><span>Reports</span></a>
-    <a href="#/account" className={route === 'account' ? 'active' : ''}><UserRound size={19} /><span>Account</span></a>
   </nav><div className="workspace-nav-bottom"><button type="button" onClick={onThemeToggle}><Moon size={18} /><span>{theme === 'dark' ? 'Dark theme' : 'Light theme'}</span></button><span className="workspace-account">WP <small>WeatherPicks workspace</small></span></div></aside>
 }
 
-function AppHeader({ route, selectedDate, today, maxDate, onDateChange, onRefresh, loading, theme, onThemeToggle, account }) {
+function AppHeader({ route, selectedDate, today, maxDate, onDateChange, onRefresh, loading, theme, onThemeToggle }) {
   const [menuOpen, setMenuOpen] = useState(false)
   const close = () => setMenuOpen(false)
   const isForecast = route === 'forecast'
@@ -92,7 +91,6 @@ function AppHeader({ route, selectedDate, today, maxDate, onDateChange, onRefres
           {isForecast && <label className="date-control"><CalendarDays size={17} /><input aria-label="Forecast date" type="date" min={today} max={maxDate} value={selectedDate} onChange={(event) => onDateChange(event.target.value)} /><span>{longDate(selectedDate)}</span><ChevronDown size={16} /></label>}
           <button className="theme-toggle" type="button" onClick={onThemeToggle} aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'} aria-pressed={theme === 'dark'} title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}>{theme === 'dark' ? <SunMedium size={18} /> : <Moon size={18} />}</button>
           {isForecast && <button className="icon-button" type="button" onClick={onRefresh} disabled={loading} aria-label="Refresh forecast"><RefreshCw className={loading ? 'spin' : ''} size={18} /></button>}
-          <a className="account-link" href="#/account">{account?.authenticated ? <><UserRound size={16} />Account</> : <><LogIn size={16} />Sign in</>}</a>
         </div>
       </div>
     </header>
@@ -122,7 +120,7 @@ function HomePage({ data, loading, error }) {
           <div className="hero-copy">
             <h1 id="hero-title">Weather picks,<br />with the evidence in view.</h1>
             <p>Independent daily-high research for {stationCopy}. Compare the settlement station, forecast range, source coverage, and monitored history before considering a weather pick.</p>
-            <div className="hero-actions"><a className="button" href="#/forecast">Explore today’s board <ArrowRight size={18} /></a><a className="text-link" href="#/account">1 free pick/day · $10/week full board <ArrowRight size={16} /></a></div>
+            <div className="hero-actions"><a className="button" href="#/forecast">Explore today’s board <ArrowRight size={18} /></a><a className="text-link" href="#/backtest">Review the backtest <ArrowRight size={16} /></a></div>
             <p className="hero-note"><span />Information only—not betting, financial, or weather-safety advice. Outcomes are not guaranteed.</p>
           </div>
           <ForecastPreview data={data} loading={loading} error={error} />
@@ -207,14 +205,12 @@ function ForecastPage({ data, selectedDate, today, maxDate, onSelectDate, loadin
   const visibleForecasts = stationFilter ? forecasts.filter((forecast) => forecast.station === stationFilter) : forecasts
   const selectedForecast = forecasts.find((forecast) => forecast.station === selectedStation)
   const selectedAccuracy = accuracy.find((station) => station.station === selectedForecast?.station)
-  const account = data?.account
-  const locked = !account?.canViewForecasts
+  const locked = false
   return <main className="forecast-page"><div className="page-width forecast-layout">
     <section className="forecast-main" aria-labelledby="forecast-title">
       <div className="forecast-heading"><div><p className="section-label">FORECAST WORKSPACE</p><h1 id="forecast-title">{longDate(selectedDate)}</h1><p>Settlement-station market analysis across {registry.length || 'all configured'} locations.</p></div><div className="refresh-inline"><button className="button button-quiet" type="button" onClick={onRefresh} disabled={loading}><RefreshCw size={16} className={loading ? 'spin' : ''} />Refresh</button></div></div>
       <DayNavigator today={today} maxDate={maxDate} selectedDate={selectedDate} onSelect={onSelectDate} />
       <ForecastControls registry={registry} selectedStation={stationFilter} onSelectStation={onStationFilter} calibratedIds={calibratedIds} showBaseline={showBaseline} onShowBaseline={onShowBaseline} onCopy={onCopy} />
-      {locked && <PickAccessPanel account={account} registry={registry} selectedStation={selectedStation} selectedDate={selectedDate} onClaim={onClaim} onSubscribe={onSubscribe} busy={billingBusy} error={billingError} />}
       {!locked && <>
       <MarketCard registry={registry} selectedStation={selectedStation} forecast={selectedForecast} onSelectStation={onSelectStation} calibratedIds={calibratedIds} />
       <IntradayChart forecast={selectedForecast} />
@@ -239,8 +235,6 @@ export default function App() {
   const [showBaseline, setShowBaseline] = useState(false)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [billingBusy, setBillingBusy] = useState(false)
-  const [billingError, setBillingError] = useState('')
   const requestController = useRef(null)
   const today = data?.today && data.today >= clockDate ? data.today : clockDate
   const maxDate = data?.maxDate ?? addDays(today, 7)
@@ -321,5 +315,5 @@ export default function App() {
       window.location.assign(session.url)
     } catch (reason) { setBillingError(reason.message || 'Could not open billing management.') } finally { setBillingBusy(false) }
   }
-  return <div className="app app-shell"><a className="skip-link" href="#main-content">Skip to content</a><WorkspaceNav route={route} theme={theme} onThemeToggle={toggleTheme} /><div className="workspace-content"><AppHeader route={route} selectedDate={selectedDate} today={today} maxDate={maxDate} onDateChange={setSelectedDate} onRefresh={forceRefresh} loading={loading} theme={theme} onThemeToggle={toggleTheme} account={data?.account} /><div id="main-content">{route === 'forecast' ? <ForecastPage data={data} selectedDate={selectedDate} today={today} maxDate={maxDate} onSelectDate={setSelectedDate} loading={loading} error={error} onRefresh={forceRefresh} selectedStation={selectedStation} onSelectStation={setSelectedStation} stationFilter={stationFilter} onStationFilter={setStationFilter} showBaseline={showBaseline} onShowBaseline={setShowBaseline} onCopy={copySummary} onClaim={claimPick} onSubscribe={beginCheckout} billingBusy={billingBusy} billingError={billingError} /> : route === 'backtest' ? <BacktestWorkspace registry={data?.stationRegistry ?? []} /> : route === 'account' ? <AccountPage account={data?.account} onSubscribe={beginCheckout} onPortal={manageBilling} busy={billingBusy} error={billingError} /> : <HomePage data={data} loading={loading} error={error} />}</div><footer className="site-footer"><div className="page-width"><Logo /><div><a href="#/how-it-works">How it works</a><a href="#/accuracy">Model notes</a><a href="#/forecast">Forecast board</a><a href="#/backtest">Backtest</a><a href="#/account">Account</a></div><p>Experimental research only—not betting, financial, or weather-safety advice.</p></div></footer></div></div>
+  return <div className="app app-shell"><a className="skip-link" href="#main-content">Skip to content</a><WorkspaceNav route={route} theme={theme} onThemeToggle={toggleTheme} /><div className="workspace-content"><AppHeader route={route} selectedDate={selectedDate} today={today} maxDate={maxDate} onDateChange={setSelectedDate} onRefresh={forceRefresh} loading={loading} theme={theme} onThemeToggle={toggleTheme} /><div id="main-content">{route === 'forecast' ? <ForecastPage data={data} selectedDate={selectedDate} today={today} maxDate={maxDate} onSelectDate={setSelectedDate} loading={loading} error={error} onRefresh={forceRefresh} selectedStation={selectedStation} onSelectStation={setSelectedStation} stationFilter={stationFilter} onStationFilter={setStationFilter} showBaseline={showBaseline} onShowBaseline={setShowBaseline} onCopy={copySummary} /> : route === 'backtest' ? <BacktestWorkspace registry={data?.stationRegistry ?? []} /> : <HomePage data={data} loading={loading} error={error} />}</div><footer className="site-footer"><div className="page-width"><Logo /><div><a href="#/how-it-works">How it works</a><a href="#/accuracy">Model notes</a><a href="#/forecast">Forecast board</a><a href="#/backtest">Backtest</a></div><p>Experimental research only—not betting, financial, or weather-safety advice.</p></div></footer></div></div>
 }

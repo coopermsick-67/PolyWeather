@@ -333,16 +333,10 @@ async function dashboardValue(url, targetDate, forceRefresh, env) {
 }
 
 async function dashboardForRequest(request, url, env) {
-  const accountRecord = await accountForRequest(request, env);
-  const account = publicAccount(accountRecord, env);
-  if (!accountRecord) return dashboardSummary(url.searchParams.get('date'), account, null);
-  const db = await requireDatabase(env);
-  const accessDate = todayForAccess();
-  const dailyPick = await existingDailyPick(db, accountRecord.id, accessDate);
-  if (!account.canViewForecasts && !dailyPick) return dashboardSummary(url.searchParams.get('date'), account, null);
   const dashboard = await dashboardValue(url, url.searchParams.get('date'), url.searchParams.get('refresh') === '1', env);
-  const allowedForecasts = account.canViewForecasts ? dashboard.forecasts : dashboard.forecasts.filter((forecast) => forecast.station === dailyPick.station_id && forecast.targetDate === dailyPick.target_date);
-  return { ...dashboard, forecasts: allowedForecasts, account: { ...account, canViewForecasts: account.canViewForecasts || Boolean(dailyPick), dailyPick: dailyPick ? { stationId: dailyPick.station_id, targetDate: dailyPick.target_date, accessDate: dailyPick.access_date } : null } };
+  // Forecast research is public. Do not require ChatGPT identity, D1, Stripe,
+  // a trial, or a per-station claim just to load the board.
+  return { ...dashboard, account: { authenticated: false, canViewForecasts: true, tier: 'public' } };
 }
 
 async function claimDailyPick(request, env) {
