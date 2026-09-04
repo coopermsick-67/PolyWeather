@@ -89,15 +89,105 @@ async function fetchFlaskDashboard(targetDate, env) {
   return body;
 }
 
+function directNbmEndpoint(stations) {
+  const endpoint = new URL('https://api.open-meteo.com/v1/forecast');
+  for (const [key, value] of Object.entries({
+    latitude: stations.map((station) => station.latitude).join(','),
+    longitude: stations.map((station) => station.longitude).join(','),
+    daily: 'temperature_2m_max',
+    temperature_unit: 'fahrenheit',
+    timezone: 'auto',
+    forecast_days: '16',
+    models: 'ncep_nbm_conus',
+  })) endpoint.searchParams.set(key, value);
+  return endpoint;
+}
+
+function directGuidanceForecast(station, targetDate, item) {
+  const daily = item?.daily;
+  const index = Array.isArray(daily?.time) ? daily.time.indexOf(targetDate) : -1;
+  const value = Number(daily?.temperature_2m_max?.[index]);
+  if (!Number.isFinite(value)) return null;
+  const high = Math.round(value);
+  // Never carry stale observations, intervals, or model output from the
+  // packaged snapshot into a live fallback result.
+  const prior = snapshot.forecasts.find((forecast) => forecast.station === station.stationId) ?? {};
+  return {
+    ...prior,
+    station: station.stationId,
+    city: station.name,
+    marketLocation: station.display_name,
+    targetDate,
+    highF: high,
+    rawModelHighF: high,
+    baselineHighF: high,
+    modelDeltaF: 0,
+    rangeLowF: high - 4,
+    rangeHighF: high + 4,
+    fourDegreeRangeLowF: high - 2,
+    fourDegreeRangeHighF: high + 2,
+    modelRange: [high - 4, high + 4],
+    uncertainty: 'High',
+    isCalibrated: false,
+    currentObservedTemperatureF: null,
+    observedHighSoFarF: null,
+    observedLowSoFarF: null,
+    intradayObservations: [],
+    lastObservationAt: null,
+    dataFreshness: null,
+    sourceAgreement: null,
+    sourceCount: 1,
+    dataQualityStatus: 'DIRECT_GUIDANCE_FALLBACK',
+    reasonCodes: ['Live NCEP NBM daily guidance via Open-Meteo. The calibrated forecast service is unavailable, so residual MOS and observed-high adjustments are deliberately disabled.'],
+    stabilityReason: 'direct_guidance_fallback',
+  };
+}
+
+async function directNbmDashboard(targetDate) {
+  const now = new Date();
+  const today = localDate(now, 'America/New_York');
+  const resolvedDate = targetDateForRequest(targetDate, today, earliestStationLocalToday(now, snapshot.stationRegistry));
+  let response;
+  try {
+    response = await fetchWithTimeout(directNbmEndpoint(snapshot.stationRegistry), { headers: { Accept: 'application/json' } }, 15_000);
+  } catch (error) {
+    throw new Error('Both calibrated and direct forecast services are unreachable: ' + (error.message || 'network error'));
+  }
+  if (!response.ok) throw new Error('Direct NCEP NBM guidance returned ' + response.status + '.');
+  const payload = await response.json().catch(() => null);
+  const stations = Array.isArray(payload) ? payload : [payload];
+  const forecasts = snapshot.stationRegistry.map((station, index) => directGuidanceForecast(station, resolvedDate, stations[index])).filter(Boolean);
+  if (!forecasts.length) throw new Error('Direct NCEP NBM guidance returned no usable daily highs.');
+  const available = new Set(forecasts.map((forecast) => forecast.station));
+  return {
+    ...snapshot,
+    today,
+    targetDate: resolvedDate,
+    maxDate: addDays(today, 7),
+    generatedAt: now.toISOString(),
+    forecasts,
+    unavailableStations: snapshot.stationRegistry.filter((station) => !available.has(station.stationId)).map((station) => station.stationId),
+    marketForecast: true,
+    forecastInputs: 'Live NCEP NBM daily-high guidance via Open-Meteo. Calibrated server-side residual MOS is temporarily unavailable.',
+    modelStatus: 'DIRECT_GUIDANCE_FALLBACK: live NCEP NBM shown without residual calibration.',
+    releaseStatus: 'Fallback guidance refreshes every 15 minutes. It is live, but it is not a substitute for the calibrated 20-station forecast service.',
+  };
+}
+
 async function liveDashboard(targetDate, env) {
-  const dashboard = await fetchFlaskDashboard(targetDate, env);
-  const registry = Array.isArray(dashboard.stationRegistry) && dashboard.stationRegistry.length ? dashboard.stationRegistry : snapshot.stationRegistry;
-  const forecastStations = new Set(dashboard.forecasts.map((forecast) => forecast.station));
-  // dashboard_payload.py omits a station entirely (rather than fabricating a
-  // value) when its live inputs are incomplete; surface which ones so the
-  // frontend can say so instead of the station silently vanishing.
-  const unavailableStations = registry.filter((station) => !forecastStations.has(station.stationId)).map((station) => station.stationId);
-  return { ...dashboard, stationRegistry: registry, unavailableStations, marketForecast: true };
+  try {
+    const dashboard = await fetchFlaskDashboard(targetDate, env);
+    const registry = Array.isArray(dashboard.stationRegistry) && dashboard.stationRegistry.length ? dashboard.stationRegistry : snapshot.stationRegistry;
+    const forecastStations = new Set(dashboard.forecasts.map((forecast) => forecast.station));
+    // dashboard_payload.py omits a station entirely (rather than fabricating a
+    // value) when its live inputs are incomplete; surface which ones so the
+    // frontend can say so instead of the station silently vanishing.
+    const unavailableStations = registry.filter((station) => !forecastStations.has(station.stationId)).map((station) => station.stationId);
+    return { ...dashboard, stationRegistry: registry, unavailableStations, marketForecast: true };
+  } catch (error) {
+    console.warn('Calibrated forecast API failed; serving labeled direct-guidance fallback.', error.message || error);
+    return directNbmDashboard(targetDate);
+  }
 }
 
 function dashboardHeaders() {
