@@ -342,3 +342,68 @@ html[data-theme="dark"] .app-shell .site-footer { background:#06172b; }
   .app-shell .page-width { width:calc(100% - 24px); }
   .app-shell .site-footer > div { width:calc(100% - 24px); }
 }
+
+/* --- Bet decision layer ------------------------------------------------- */
+/* PASS must never be able to pass for a recommendation at a glance, so the
+   affirmative colour is reserved for elite/strong and nothing else. */
+.bet-badge { display: inline-flex; align-items: center; gap: .4rem; padding: .25rem .55rem;
+  border-radius: 999px; font-size: .74rem; font-weight: 600; letter-spacing: .02em;
+  border: 1px solid transparent; white-space: nowrap; }
+.bet-badge b { font-weight: 700; opacity: .85; }
+.bet-badge-elite { background: color-mix(in srgb, #16a34a 18%, transparent); color: #22c55e; border-color: color-mix(in srgb, #16a34a 45%, transparent); }
+.bet-badge-strong { background: color-mix(in srgb, #16a34a 12%, transparent); color: #4ade80; border-color: color-mix(in srgb, #16a34a 32%, transparent); }
+.bet-badge-playable { background: color-mix(in srgb, #eab308 12%, transparent); color: #facc15; border-color: color-mix(in srgb, #eab308 28%, transparent); }
+.bet-badge-marginal { background: color-mix(in srgb, #f97316 12%, transparent); color: #fb923c; border-color: color-mix(in srgb, #f97316 28%, transparent); }
+.bet-badge-pass { background: color-mix(in srgb, currentColor 8%, transparent); color: var(--muted); border-color: color-mix(in srgb, currentColor 22%, transparent); }
+.bet-badge-unknown { background: transparent; color: var(--muted); border-color: color-mix(in srgb, currentColor 20%, transparent); }
+
+.forecast-row-passed { opacity: .62; }
+.forecast-row-passed:hover, .forecast-row-passed:focus-visible { opacity: 1; }
+.forecast-table-empty { padding: 1.25rem; color: var(--muted); font-size: .9rem; }
+.only-recommended { display: inline-flex; align-items: center; gap: .45rem; font-size: .82rem; color: var(--muted); cursor: pointer; }
+
+.bet-summary { border: 1px solid var(--border); border-radius: 14px; padding: 1.1rem 1.25rem;
+  background: var(--surface); margin-bottom: 1rem; }
+.bet-summary-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 1rem; flex-wrap: wrap; }
+.bet-summary-head h2 { font-size: 1.08rem; margin: .15rem 0 .3rem; }
+.bet-summary-head p { color: var(--muted); font-size: .86rem; margin: 0; }
+.mode-select { display: inline-flex; align-items: center; gap: .4rem; border: 1px solid var(--border);
+  border-radius: 9px; padding: .3rem .55rem; color: var(--muted); }
+.mode-select select { background: transparent; border: 0; color: inherit; font: inherit; }
+.bet-summary-counts { display: flex; gap: .55rem; flex-wrap: wrap; margin: .9rem 0 .6rem; }
+.bet-count { min-width: 74px; padding: .5rem .65rem; border-radius: 10px; border: 1px solid var(--border); text-align: center; }
+.bet-count strong { display: block; font-size: 1.2rem; }
+.bet-count span { font-size: .72rem; color: var(--muted); }
+.bet-count-elite, .bet-count-strong { border-color: color-mix(in srgb, #16a34a 40%, transparent); }
+.bet-summary-stats { display: flex; gap: 1.4rem; flex-wrap: wrap; margin: 0; }
+.bet-summary-stats dt { font-size: .72rem; color: var(--muted); }
+.bet-summary-stats dd { margin: .1rem 0 0; font-weight: 600; }
+
+.bet-verdict { border: 1px solid var(--border); border-radius: 14px; padding: 1.1rem 1.2rem;
+  background: var(--surface); display: grid; gap: .85rem; }
+.bet-verdict-elite, .bet-verdict-strong { border-color: color-mix(in srgb, #16a34a 45%, transparent); }
+.bet-verdict-pass, .bet-verdict-unknown { border-style: dashed; }
+.bet-verdict-head { display: flex; justify-content: space-between; align-items: flex-start; gap: .75rem; }
+.bet-verdict-head h3 { margin: .2rem 0 0; font-size: 1.05rem; }
+.bet-verdict-facts { display: grid; grid-template-columns: 1fr 1fr; gap: .6rem 1rem; margin: 0; }
+.bet-verdict-facts dt { font-size: .72rem; color: var(--muted); }
+.bet-verdict-facts dd { margin: .1rem 0 0; font-weight: 600; }
+.bet-reasons h4 { font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 0 0 .35rem; }
+.bet-reasons ul { margin: 0; padding-left: 1.05rem; display: grid; gap: .3rem; }
+.bet-reasons li { font-size: .84rem; line-height: 1.45; }
+.bet-reasons-blocking li { color: #fca5a5; }
+.bet-reasons-supporting li { color: #86efac; }
+.bet-breakdown summary { cursor: pointer; font-size: .82rem; color: var(--muted); }
+.score-row { display: grid; grid-template-columns: 1fr 70px auto; align-items: center; gap: .55rem;
+  font-size: .8rem; padding: .28rem 0; }
+.score-track { display: block; height: 5px; border-radius: 3px; background: color-mix(in srgb, currentColor 14%, transparent); overflow: hidden; }
+.score-track b { display: block; height: 100%; background: currentColor; opacity: .65; }
+.score-row small { opacity: .6; font-weight: 400; }
+.bet-alternatives { display: flex; flex-wrap: wrap; gap: .5rem; font-size: .8rem; padding-top: .4rem; }
+.bet-alternatives span { border: 1px solid var(--border); border-radius: 8px; padding: .2rem .5rem; }
+.bet-verdict-note { font-size: .76rem; color: var(--muted); margin: 0; }
+
+@media (max-width: 700px) {
+  .bet-verdict-facts { grid-template-columns: 1fr; }
+  .bet-summary-stats { gap: .9rem; }
+}

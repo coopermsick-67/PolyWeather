@@ -17,6 +17,8 @@ import AccuracyPanel from './components/AccuracyPanel'
 import StatusPanel from './components/StatusPanel'
 import TrendChart from './components/TrendChart'
 import BacktestWorkspace from './components/BacktestWorkspace'
+import BetSummary from './components/BetSummary'
+import BetVerdict from './components/BetVerdict'
 
 function formatStationList(registry, limit = 8) {
   if (!registry?.length) return null
@@ -205,7 +207,7 @@ function AccountPage({ account, onSubscribe, onPortal, busy, error }) {
     <div className="account-actions">{account.role !== 'admin' && account.tier !== 'member' && <SubscriptionButton account={account} onSubscribe={onSubscribe} busy={busy} />}{account.role !== 'admin' && account.subscriptionStatus !== 'none' && <button className="button button-quiet" type="button" onClick={onPortal} disabled={busy}>Manage billing</button>}</div>{error && <p className="access-error" role="status">{error}</p>}</section><section className="account-details"><div><strong>Free trial</strong><span>1 pick per calendar day for 7 days</span></div><div><strong>Full board</strong><span>All available picks and forecast dates</span></div><div><strong>Membership price</strong><span>$10 per week, recurring until cancelled</span></div></section></main>
 }
 
-function ForecastPage({ data, selectedDate, today, maxDate, onSelectDate, loading, error, onRefresh, selectedStation, onSelectStation, stationFilter, onStationFilter, showBaseline, onShowBaseline, onCopy, onClaim, onSubscribe, billingBusy, billingError }) {
+function ForecastPage({ data, selectedDate, today, maxDate, onSelectDate, loading, error, onRefresh, selectedStation, onSelectStation, stationFilter, onStationFilter, showBaseline, onShowBaseline, onCopy, onlyRecommended, onOnlyRecommended, filterMode, onFilterMode, onClaim, onSubscribe, billingBusy, billingError }) {
   const forecasts = data?.forecasts ?? []
   const registry = data?.stationRegistry ?? []
   const accuracy = data?.accuracy ?? []
@@ -220,16 +222,17 @@ function ForecastPage({ data, selectedDate, today, maxDate, onSelectDate, loadin
       <DayNavigator today={today} maxDate={maxDate} selectedDate={selectedDate} onSelect={onSelectDate} />
       <ForecastControls registry={registry} selectedStation={stationFilter} onSelectStation={onStationFilter} calibratedIds={calibratedIds} showBaseline={showBaseline} onShowBaseline={onShowBaseline} onCopy={onCopy} />
       {!locked && <>
+      <BetSummary summary={data?.betSummary} mode={filterMode} onModeChange={onFilterMode} />
       <MarketCard registry={registry} selectedStation={selectedStation} forecast={selectedForecast} onSelectStation={onSelectStation} calibratedIds={calibratedIds} />
       <ForecastFanChart forecast={selectedForecast} />
       <IntradayChart forecast={selectedForecast} />
       {error && <div className="alert" role="status"><strong>Live refresh could not finish.</strong><span>The last successful values remain visible. Try refreshing again in a moment.</span></div>}
-      <ForecastTable forecasts={visibleForecasts} loading={loading} showBaseline={showBaseline} selectedStation={selectedStation} onSelectStation={onSelectStation} />
+      <ForecastTable forecasts={visibleForecasts} loading={loading} showBaseline={showBaseline} selectedStation={selectedStation} onSelectStation={onSelectStation} onlyRecommended={onlyRecommended} onOnlyRecommended={onOnlyRecommended} />
       <section className="performance-card" aria-labelledby="performance-title"><div className="card-title"><div><p className="section-label">MONITORED PERFORMANCE</p><h2 id="performance-title">Recent model performance</h2><p>Rolling mean absolute error compared with the raw NBM guidance.</p></div><a className="text-link" href="#/accuracy">About monitoring <ArrowRight size={15} /></a></div><TrendChart trend={data?.trend} loading={loading} /></section>
       <AccuracyPanel accuracy={accuracy} evidence={data?.modelEvidence} onSelectStation={onSelectStation} selectedStation={selectedStation} />
       </>}
     </section>
-    {!locked && <aside className="forecast-side"><StationInsight forecast={selectedForecast} accuracy={selectedAccuracy} evidence={data?.modelEvidence} rankedCount={accuracy.length} /><ForecastBrief evidence={data?.modelEvidence} /><StatusPanel data={data} loading={loading} /></aside>}
+    {!locked && <aside className="forecast-side"><BetVerdict decision={selectedForecast?.betDecision} /><StationInsight forecast={selectedForecast} accuracy={selectedAccuracy} evidence={data?.modelEvidence} rankedCount={accuracy.length} /><ForecastBrief evidence={data?.modelEvidence} /><StatusPanel data={data} loading={loading} /></aside>}
   </div></main>
 }
 
@@ -242,6 +245,10 @@ export default function App() {
   const [selectedStation, setSelectedStation] = useState(null)
   const [stationFilter, setStationFilter] = useState(null)
   const [showBaseline, setShowBaseline] = useState(false)
+  const [onlyRecommended, setOnlyRecommended] = useState(false)
+  // Selectivity is a display preference over an already-computed decision;
+  // it never changes the forecast, so it does not trigger a refetch.
+  const [filterMode, setFilterMode] = useState('conservative')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const requestController = useRef(null)
@@ -324,5 +331,5 @@ export default function App() {
       window.location.assign(session.url)
     } catch (reason) { setBillingError(reason.message || 'Could not open billing management.') } finally { setBillingBusy(false) }
   }
-  return <div className="app app-shell"><a className="skip-link" href="#main-content">Skip to content</a><WorkspaceNav route={route} theme={theme} onThemeToggle={toggleTheme} /><div className="workspace-content"><AppHeader route={route} selectedDate={selectedDate} today={today} maxDate={maxDate} onDateChange={setSelectedDate} onRefresh={forceRefresh} loading={loading} theme={theme} onThemeToggle={toggleTheme} /><div id="main-content">{route === 'forecast' ? <ForecastPage data={data} selectedDate={selectedDate} today={today} maxDate={maxDate} onSelectDate={setSelectedDate} loading={loading} error={error} onRefresh={forceRefresh} selectedStation={selectedStation} onSelectStation={setSelectedStation} stationFilter={stationFilter} onStationFilter={setStationFilter} showBaseline={showBaseline} onShowBaseline={setShowBaseline} onCopy={copySummary} /> : route === 'backtest' ? <BacktestWorkspace registry={data?.stationRegistry ?? []} /> : <HomePage data={data} loading={loading} error={error} route={route} />}</div><footer className="site-footer"><div className="page-width"><Logo /><div><a href="#/how-it-works">How it works</a><a href="#/accuracy">Model notes</a><a href="#/forecast">Forecast board</a><a href="#/backtest">Backtest</a></div><p>Experimental research only—not betting, financial, or weather-safety advice.</p></div></footer></div></div>
+  return <div className="app app-shell"><a className="skip-link" href="#main-content">Skip to content</a><WorkspaceNav route={route} theme={theme} onThemeToggle={toggleTheme} /><div className="workspace-content"><AppHeader route={route} selectedDate={selectedDate} today={today} maxDate={maxDate} onDateChange={setSelectedDate} onRefresh={forceRefresh} loading={loading} theme={theme} onThemeToggle={toggleTheme} /><div id="main-content">{route === 'forecast' ? <ForecastPage data={data} selectedDate={selectedDate} today={today} maxDate={maxDate} onSelectDate={setSelectedDate} loading={loading} error={error} onRefresh={forceRefresh} selectedStation={selectedStation} onSelectStation={setSelectedStation} stationFilter={stationFilter} onStationFilter={setStationFilter} showBaseline={showBaseline} onShowBaseline={setShowBaseline} onCopy={copySummary} onlyRecommended={onlyRecommended} onOnlyRecommended={setOnlyRecommended} filterMode={filterMode} onFilterMode={setFilterMode} /> : route === 'backtest' ? <BacktestWorkspace registry={data?.stationRegistry ?? []} /> : <HomePage data={data} loading={loading} error={error} route={route} />}</div><footer className="site-footer"><div className="page-width"><Logo /><div><a href="#/how-it-works">How it works</a><a href="#/accuracy">Model notes</a><a href="#/forecast">Forecast board</a><a href="#/backtest">Backtest</a></div><p>Experimental research only—not betting, financial, or weather-safety advice.</p></div></footer></div></div>
 }

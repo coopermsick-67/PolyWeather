@@ -20,6 +20,20 @@ import joblib
 import numpy as np
 import pandas as pd
 
+from . import bet_evidence
+from .betfilter import (
+    BetEvidence,
+    DataQuality,
+    ForecastSnapshot,
+    analyze_ensemble,
+    analyze_observation,
+    analyze_stability,
+    decide,
+    from_calibrated_interval,
+    from_residual_history,
+    summarize,
+)
+from .betfilter.config import DEFAULT_CONFIG, BetFilterConfig
 from .data import MODEL_SOURCES, fetch_live_forecast_features, fetch_live_station_snapshot, has_complete_core_guidance
 from .markets import QualityStatus, quality_gate
 from .model import (
@@ -334,6 +348,150 @@ def payload(target_date: date) -> dict:
     return _assemble_payload(target_date, forecasts, model_version)
 
 
+SNAPSHOT_HISTORY_LIMIT = 24
+BET_FILTER_MODE = os.environ.get("WEATHERPICKS_BET_FILTER_MODE", "conservative")
+BET_FILTER_ENABLED = os.environ.get("WEATHERPICKS_BET_FILTER", "1") != "0"
+
+
+def _bet_filter_config() -> BetFilterConfig:
+    try:
+        return BetFilterConfig().for_mode(BET_FILTER_MODE)  # type: ignore[arg-type]
+    except ValueError:
+        logging.getLogger(__name__).warning(
+            "Unknown bet-filter mode %r; falling back to conservative.", BET_FILTER_MODE
+        )
+        return DEFAULT_CONFIG
+
+
+def _record_snapshot(
+    state_entry: dict[str, Any], predicted_high_f: float, bucket_lower_f: int | None
+) -> list[ForecastSnapshot]:
+    """Append this refresh to the station-day's forecast trail and return it.
+
+    Stability cannot be measured from a single value, so the trail is the
+    only thing that makes "has this forecast stopped moving?" answerable.
+    History is appended to, never rewritten: overwriting past snapshots
+    would erase exactly the revisions the filter needs to see.
+    """
+    history = list(state_entry.get("snapshots", []))
+    history.append({
+        "capturedAt": datetime.now(timezone.utc).isoformat(),
+        "predictedHighF": round(float(predicted_high_f), 2),
+        "bucketLowerF": bucket_lower_f,
+    })
+    state_entry["snapshots"] = history[-SNAPSHOT_HISTORY_LIMIT:]
+    parsed: list[ForecastSnapshot] = []
+    for item in state_entry["snapshots"]:
+        try:
+            parsed.append(ForecastSnapshot(
+                captured_at=datetime.fromisoformat(str(item["capturedAt"])),
+                predicted_high_f=float(item["predictedHighF"]),
+                bucket_lower_f=item.get("bucketLowerF"),
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return parsed
+
+
+def _bet_decision(
+    station: Any,
+    features: dict[str, Any],
+    observation: dict[str, Any] | None,
+    predicted_high_f: float,
+    interval_lower_f: float | None,
+    interval_upper_f: float | None,
+    is_calibrated: bool,
+    supported_horizon: bool,
+    completeness: float,
+    target_date: date,
+    is_same_day: bool,
+    snapshots: list[ForecastSnapshot],
+    config: BetFilterConfig,
+) -> dict[str, Any] | None:
+    """Run the decision layer for one station and return its verdict.
+
+    Returns ``None`` only when the filter is switched off. Every other path
+    -- including missing inputs -- produces a real decision, because
+    "we could not evaluate this" is itself an answer the board must show
+    rather than an excuse to fall back to a bare forecast.
+    """
+    if not BET_FILTER_ENABLED:
+        return None
+    icao = station.icao
+    observed_high = observation.get("observedDailyHighF") if observation else None
+    if is_calibrated and interval_lower_f is not None and interval_upper_f is not None:
+        residuals = bet_evidence.residuals_for(icao)
+        try:
+            if residuals is not None:
+                distribution = from_residual_history(
+                    predicted_high_f, residuals,
+                    observed_high_floor_f=observed_high if is_same_day else None,
+                )
+            else:
+                raise ValueError("no residual history")
+        except ValueError:
+            distribution = from_calibrated_interval(
+                predicted_high_f, interval_lower_f, interval_upper_f, 0.80,
+                observed_high_floor_f=observed_high if is_same_day else None,
+            )
+    else:
+        # Without a validated interval there is no honest distribution to
+        # build. A nominal one is created only so the gates can run and
+        # report DATA_INSUFFICIENT with a real reason attached.
+        distribution = from_calibrated_interval(predicted_high_f, predicted_high_f - 4, predicted_high_f + 4, 0.80)
+    market_bucket = bet_evidence.bucket_for(predicted_high_f)
+    ensemble = analyze_ensemble({
+        source: features.get(f"{source}__tmax_f") for source in MODEL_SOURCES
+    })
+    stability = analyze_stability(snapshots)
+    reliability = bet_evidence.reliability_for(icao)
+    alignment = analyze_observation(
+        is_same_day=is_same_day,
+        predicted_high_f=predicted_high_f,
+        current_temperature_f=observation.get("currentObservedTemperatureF") if observation else None,
+        observed_high_so_far_f=observed_high,
+        bucket_upper_f=market_bucket[1] + 0.5,
+    )
+    fetched_at = features.get("source_fetched_at_utc")
+    age_minutes: float | None = None
+    if fetched_at:
+        try:
+            age_minutes = (
+                datetime.now(timezone.utc) - datetime.fromisoformat(str(fetched_at))
+            ).total_seconds() / 60.0
+        except (TypeError, ValueError):
+            age_minutes = None
+    horizon_hours = max(
+        0.0, (datetime.combine(target_date, datetime.min.time(), tzinfo=station.tzinfo)
+              + timedelta(hours=17) - datetime.now(station.tzinfo)).total_seconds() / 3600.0
+    )
+    evidence = BetEvidence(
+        station=icao,
+        target_date=target_date.isoformat(),
+        is_same_day=is_same_day,
+        distribution=distribution,
+        ensemble=ensemble,
+        stability=stability,
+        reliability=reliability,
+        observation=alignment,
+        data_quality=DataQuality(
+            is_calibrated=is_calibrated,
+            supported_horizon=supported_horizon,
+            feature_completeness=completeness,
+            source_count=ensemble.source_count,
+            # Every configured station maps to a documented settlement ICAO;
+            # the market *contract* for it is a separate, unverified thing
+            # and is reported through dataQualityStatus, not here.
+            settlement_station_verified=True,
+            data_age_minutes=age_minutes,
+            forecast_horizon_hours=horizon_hours,
+        ),
+        market_bucket=market_bucket,
+        calibrator=bet_evidence.probability_calibrator(),
+    )
+    return decide(evidence, config).to_dict()
+
+
 def _build_forecasts(
     live_inputs: list[tuple[Any, dict[str, Any], dict[str, Any] | None]],
     model: Any,
@@ -344,6 +502,7 @@ def _build_forecasts(
     stability_state: dict[str, Any],
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     forecasts: list[dict[str, Any]] = []
+    filter_config = _bet_filter_config()
     for station, features, observation in live_inputs:
         icao = station.icao
         baseline_high = float(features.get("nbm_baseline_f", np.nan))
@@ -379,13 +538,16 @@ def _build_forecasts(
         # previous artifact. Within one artifact, the existing two-degree
         # stability rule still suppresses inconsequential refresh churn.
         state_key = f"{model_version}::{target_date.isoformat()}::{icao}"
-        previous = saved_forecasts.get(state_key, {}).get("display_high_f")
+        entry = dict(saved_forecasts.get(state_key, {}))
+        previous = entry.get("display_high_f")
         high, stability_reason = stabilize_display_high(previous, candidate_high, observed_high_rounded)
-        saved_forecasts[state_key] = {
+        snapshots = _record_snapshot(entry, predicted_high, bet_evidence.bucket_for(predicted_high)[0])
+        entry.update({
             "display_high_f": high,
             "candidate_high_f": candidate_high,
             "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-        }
+        })
+        saved_forecasts[state_key] = entry
         interval_lower = float(prediction["interval_lower_f"]) if prediction is not None else None
         interval_upper = float(prediction["interval_upper_f"]) if prediction is not None else None
         interval_width = interval_upper - interval_lower if prediction is not None else None
@@ -463,11 +625,58 @@ def _build_forecasts(
                     "NO BET: no provider-specific market settlement contract has been verified for this display." ,
                 ))),
                 "stabilityReason": stability_reason,
+                # The decision layer is intentionally the last thing to run
+                # and is kept in its own key: the forecast fields above are
+                # exactly what they were before it existed, so the weather
+                # model and the betting filter can never be confused for
+                # one another by a consumer of this payload.
+                "betDecision": _bet_decision(
+                    station=station, features=features, observation=observation,
+                    predicted_high_f=predicted_high,
+                    interval_lower_f=interval_lower, interval_upper_f=interval_upper,
+                    is_calibrated=is_calibrated, supported_horizon=supported_horizon,
+                    completeness=completeness, target_date=target_date,
+                    is_same_day=observation is not None,
+                    snapshots=snapshots, config=filter_config,
+                ),
             }
         )
     stability_state["forecasts"] = saved_forecasts
     stability_state["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
     return forecasts, stability_state
+
+
+def _bet_summary(forecasts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Board-level selectivity counts.
+
+    Deliberately reports how much of the board was rejected, not just what
+    was recommended: a board showing four plays out of twenty is the
+    intended outcome and needs to read that way rather than looking like
+    sixteen failures.
+    """
+    decisions = [item["betDecision"] for item in forecasts if item.get("betDecision")]
+    if not decisions:
+        return None
+    counts: dict[str, int] = {}
+    for decision in decisions:
+        counts[decision["tier"]] = counts.get(decision["tier"], 0) + 1
+    recommended = [item for item in decisions if item["recommended"]]
+    rejected = [item for item in decisions if not item["recommended"]]
+    probabilities = [item["bucket"]["probability"] for item in recommended if item.get("bucket")]
+    rejected_probabilities = [item["bucket"]["probability"] for item in rejected if item.get("bucket")]
+    return {
+        "evaluated": len(decisions),
+        "counts": counts,
+        "recommended": len(recommended),
+        "coverageRate": round(len(recommended) / len(decisions), 4),
+        "mode": decisions[0]["mode"],
+        "averageRecommendedProbability": (
+            round(float(np.mean(probabilities)), 4) if probabilities else None
+        ),
+        "averagePassProbability": (
+            round(float(np.mean(rejected_probabilities)), 4) if rejected_probabilities else None
+        ),
+    }
 
 
 def _assemble_payload(target_date: date, forecasts: list[dict[str, Any]], model_version: str) -> dict:
@@ -488,6 +697,7 @@ def _assemble_payload(target_date: date, forecasts: list[dict[str, Any]], model_
         "releaseStatus": "Experimental shadow monitoring — not operational guidance",
         "modelVersion": model_version,
         "stabilityPolicy": "Minor refresh changes under 2°F are held; observed highs can update today.",
+        "betSummary": _bet_summary(forecasts),
     }
 
 
