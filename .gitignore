@@ -22,3 +22,13 @@ dashboard/.env
 dashboard/.env.local
 
 .claude/worktrees/
+
+# Release tarballs built for deploy, not source.
+*.tgz
+
+# Report subdirectories hold regenerable evidence (parquet/CSV/JSON) and run
+# logs; the narrative .md files in them are the tracked deliverable.
+reports/**/*.parquet
+reports/**/*.csv
+reports/**/*.json
+reports/**/*.log

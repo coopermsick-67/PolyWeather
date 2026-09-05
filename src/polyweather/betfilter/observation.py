@@ -112,7 +112,7 @@ def analyze(
     impossible = bool(
         observed_high_so_far_f is not None
         and bucket_upper_f is not None
-        and observed_high_so_far_f > bucket_upper_f
+        and observed_high_so_far_f >= bucket_upper_f
     )
     if impossible:
         notes.append(

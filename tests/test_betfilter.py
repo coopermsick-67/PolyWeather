@@ -233,7 +233,7 @@ def test_six_hour_revision_is_measured_over_the_window_not_the_whole_history():
         ForecastSnapshot(NOW - timedelta(hours=1), 94.4),
     ]
     analysis = analyze_stability(snapshots, now=NOW)
-    assert analysis.change_6h_f == pytest.approx(0.4)
+    assert analysis.change_6h_f is None  # no sufficiently close six-hour baseline
     assert analysis.change_24h_f == pytest.approx(-4.6)
 
 
@@ -379,6 +379,8 @@ def _evidence(
             feature_completeness=completeness, source_count=len(sources or {}) or 4,
             settlement_station_verified=verified, data_age_minutes=data_age,
             forecast_horizon_hours=horizon_hours,
+            source_run_age_verified=True,
+            probability_calibration_verified=True,
         ),
         market_bucket=market_bucket,
     )
@@ -745,3 +747,22 @@ def test_calibration_never_raises_confidence_beyond_the_range_it_was_fitted_on()
     assert fitted.apply(0.55) >= 0.55  # inside the range the fit may raise
     assert fitted.apply(0.95) <= 0.95  # outside it, never
     assert fitted.apply(0.10) <= 0.10
+
+
+def test_a_forecast_with_no_revision_history_cannot_satisfy_the_stability_gate():
+    """Every station-day's first refresh has a single snapshot, so 6-hour
+    movement is unmeasurable. Folding that into ``or 0.0`` scored it as
+    perfectly steady and let the least-evidenced forecast of the day pass
+    the gate outright -- unknown must not read as calm."""
+    decision = decide(_evidence(snapshots=_snapshots([94.5]), observed_high=92.0))
+    assert decision.tier == "DATA_INSUFFICIENT"
+    assert decision.recommended is False
+    assert any(reason["code"] == "FORECAST_STABILITY_UNKNOWN" for reason in decision.reasons)
+
+
+def test_a_measurable_revision_trail_still_passes_the_stability_gate():
+    """The guard above must reject only unmeasurable movement, not tighten
+    the threshold for forecasts that do carry a trail."""
+    decision = decide(_evidence(snapshots=_snapshots([94.4, 94.5, 94.5]), observed_high=92.0))
+    assert decision.tier != "DATA_INSUFFICIENT"
+    assert not any(reason["code"] == "FORECAST_STABILITY_UNKNOWN" for reason in decision.reasons)

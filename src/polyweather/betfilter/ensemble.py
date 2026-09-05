@@ -17,6 +17,15 @@ import numpy as np
 OUTLIER_MAD_THRESHOLD = 3.0
 
 
+# Two "independent" guidance sources reporting the exact same value to this
+# many decimal places are not independent evidence -- see AUDIT.md item 1:
+# this system's own archived HRRR/GFS Tmax inputs matched exactly on 99.8%
+# of held-out rows, evidence of upstream aliasing or fallback substitution
+# rather than genuine model agreement. Real, independently-run NWP guidance
+# essentially never lands on the identical floating-point value.
+DUPLICATE_VALUE_DECIMALS = 6
+
+
 @dataclass(frozen=True)
 class EnsembleAnalysis:
     sources: dict[str, float]
@@ -29,10 +38,24 @@ class EnsembleAnalysis:
     standard_deviation_f: float
     agreement_score: float
     outliers: list[str] = field(default_factory=list)
+    duplicate_groups: tuple[tuple[str, ...], ...] = ()
 
     @property
     def source_count(self) -> int:
         return len(self.sources)
+
+    @property
+    def distinct_value_count(self) -> int:
+        """Sources counted once per distinct reported value, not per name.
+
+        Corroboration requires the sources to actually disagree with each
+        other in general even when they happen to agree on one day; sources
+        that are byte-for-byte identical are, at best, one source reported
+        twice and must not inflate a source-count or agreement gate.
+        """
+        if not self.sources:
+            return 0
+        return len({round(value, DUPLICATE_VALUE_DECIMALS) for value in self.sources.values()})
 
 
 def analyze(
@@ -82,6 +105,10 @@ def analyze(
     # single wild source cannot produce a negative score that later
     # arithmetic would treat as a bonus.
     agreement = max(0.0, 1.0 - spread / reference_spread_f) if values.size >= 2 else 0.0
+    groups: dict[float, list[str]] = {}
+    for name, value in usable.items():
+        groups.setdefault(round(value, DUPLICATE_VALUE_DECIMALS), []).append(name)
+    duplicate_groups = tuple(tuple(sorted(members)) for members in groups.values() if len(members) > 1)
     return EnsembleAnalysis(
         sources=usable,
         mean_f=float(values.mean()),
@@ -93,6 +120,7 @@ def analyze(
         standard_deviation_f=float(values.std(ddof=1)) if values.size >= 2 else 0.0,
         agreement_score=agreement,
         outliers=outliers,
+        duplicate_groups=duplicate_groups,
     )
 
 

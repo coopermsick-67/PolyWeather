@@ -45,6 +45,10 @@ class ProbabilityCalibrator:
     fitted_through: str | None = None
 
     def apply(self, probability: float) -> float:
+        if not np.isfinite(probability) or not 0.0 <= probability <= 1.0:
+            raise ValueError("Probability must be finite and in [0, 1].")
+        if probability == 0.0:
+            return 0.0
         if not self.knots_x:
             return probability
         corrected = float(np.clip(np.interp(probability, self.knots_x, self.knots_y), 0.0, 1.0))
@@ -107,8 +111,12 @@ def fit(
     """
     probabilities = np.asarray(stated_probability, dtype=float)
     outcomes = np.asarray(settled, dtype=float)
+    if probabilities.ndim != 1 or probabilities.shape != outcomes.shape:
+        raise ValueError("Calibration requires equally sized one-dimensional arrays.")
     mask = np.isfinite(probabilities) & np.isfinite(outcomes)
     probabilities, outcomes = probabilities[mask], outcomes[mask]
+    if ((probabilities < 0) | (probabilities > 1)).any() or not np.isin(outcomes, [0, 1]).all():
+        raise ValueError("Calibration requires probabilities in [0, 1] and binary outcomes.")
     if probabilities.size < minimum_rows or IsotonicRegression is None:
         return IDENTITY
     if len(np.unique(outcomes)) < 2:

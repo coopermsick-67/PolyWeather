@@ -220,7 +220,8 @@ def command_log_current(args: argparse.Namespace) -> None:
     target_date = args.target_date or (date.today() + timedelta(days=1))
     requested = _requested_stations(args.stations, args.model)
     model_hash = hashlib.sha256(Path(args.model).read_bytes()).hexdigest()
-    records = create_shadow_records(
+    from .shadow import create_shadow_run
+    records = create_shadow_run(
         model,
         [require_station(icao) for icao in requested],
         target_date,

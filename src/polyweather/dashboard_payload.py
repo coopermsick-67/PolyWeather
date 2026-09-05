@@ -351,6 +351,17 @@ def payload(target_date: date) -> dict:
 SNAPSHOT_HISTORY_LIMIT = 24
 BET_FILTER_MODE = os.environ.get("WEATHERPICKS_BET_FILTER_MODE", "conservative")
 BET_FILTER_ENABLED = os.environ.get("WEATHERPICKS_BET_FILTER", "1") != "0"
+# Single source of truth for whether a provider-specific market settlement
+# contract (exact station, product, rounding rule, and entry cutoff) has been
+# verified for these forecasts. Every station maps to a documented NOAA/NCEI
+# settlement ICAO, but that is a data-quality fact, not a confirmed betting
+# contract. Before this was split into two independent, disagreeing values --
+# `quality_gate` was told `rules_available=False` (forcing the *display*
+# status to NO BET) while `DataQuality.settlement_station_verified` was
+# hardcoded `True` (so the *decision engine's* own hard gate never enforced
+# this at all). Flip this only after a specific provider's contract has
+# actually been confirmed.
+SETTLEMENT_CONTRACT_VERIFIED = False
 
 
 def _bet_filter_config() -> BetFilterConfig:
@@ -452,7 +463,7 @@ def _bet_decision(
         observed_high_so_far_f=observed_high,
         bucket_upper_f=market_bucket[1] + 0.5,
     )
-    fetched_at = features.get("source_fetched_at_utc")
+    fetched_at = features.get("source_run_initialized_at_utc")
     age_minutes: float | None = None
     if fetched_at:
         try:
@@ -478,13 +489,23 @@ def _bet_decision(
             is_calibrated=is_calibrated,
             supported_horizon=supported_horizon,
             feature_completeness=completeness,
-            source_count=ensemble.source_count,
+            # Count distinct reported values, not raw source names: two
+            # "independent" guidance sources that came back byte-identical
+            # (see AUDIT.md item 1 -- HRRR/GFS matched exactly on 99.8% of
+            # held-out rows) are one source duplicated, not two sources
+            # corroborating each other.
+            source_count=ensemble.distinct_value_count,
             # Every configured station maps to a documented settlement ICAO;
-            # the market *contract* for it is a separate, unverified thing
-            # and is reported through dataQualityStatus, not here.
-            settlement_station_verified=True,
+            # the market *contract* for it is a separate thing, and this must
+            # bind the decision engine's own hard gate, not just the display
+            # status computed below via `quality_gate`.
+            settlement_station_verified=SETTLEMENT_CONTRACT_VERIFIED,
             data_age_minutes=age_minutes,
             forecast_horizon_hours=horizon_hours,
+            source_run_age_verified=features.get("source_run_age_verified") is True,
+            # The existing binary calibration artifact has no independent
+            # later validation for the deployed empirical distribution.
+            probability_calibration_verified=False,
         ),
         market_bucket=market_bucket,
         calibrator=bet_evidence.probability_calibrator(),
@@ -560,7 +581,7 @@ def _build_forecasts(
         # date have been reviewed, weather output may be displayed but it is
         # never an actionable market pick.
         status = quality_gate(
-            station_known=True, rules_available=False, freshness=freshness,
+            station_known=True, rules_available=SETTLEMENT_CONTRACT_VERIFIED, freshness=freshness,
             agreement=source_agreement, interval_width_f=interval_width,
         )
         if status is QualityStatus.UNKNOWN_SETTLEMENT_RULE or not is_calibrated or not complete_guidance:
@@ -588,6 +609,14 @@ def _build_forecasts(
                     "timezone": features.get("source_timezone"),
                     "runId": None,
                     "runIdNote": "The standard source endpoint does not expose a stable forecast-run ID.",
+                    # `fetchedAt` (and the "data age" hard gate computed from
+                    # it) measures when *this server* retrieved the response,
+                    # not when the underlying NBM/HRRR/GFS model run was
+                    # actually produced. A model run from hours ago fetched
+                    # just now reads as age-zero. Without a real run
+                    # identifier this cannot be verified from this endpoint;
+                    # see AUDIT.md item 14.
+                    "sourceRunAgeVerified": False,
                 },
                 "settlementSource": "NOAA/NCEI Daily Summaries TMAX (final); NWS observations are preliminary",
                 "dataQualityStatus": status.value,
@@ -599,12 +628,10 @@ def _build_forecasts(
                 # The displayed high can be stabilized or lifted by today's
                 # observation. Compare NBM with the raw model output instead.
                 "modelDeltaF": raw_model_high_rounded - baseline_high_rounded,
-                # Anchored on the stabilized display high, but sized from the
-                # model's own per-station split-conformal half-width rather
-                # than a fixed placeholder, so the band reflects that
-                # station's real calibrated uncertainty for this forecast.
-                "rangeLowF": int(np.rint(interval_lower + (high - predicted_high))) if interval_lower is not None else None,
-                "rangeHighF": int(np.rint(interval_upper + (high - predicted_high))) if interval_upper is not None else None,
+                # Preserve the evaluated model interval. Display smoothing
+                # has no validated uncertainty translation policy.
+                "rangeLowF": int(np.floor(interval_lower)) if interval_lower is not None else None,
+                "rangeHighF": int(np.ceil(interval_upper)) if interval_upper is not None else None,
                 "fourDegreeRangeLowF": high - FOUR_DEGREE_HALF_WIDTH_F if is_calibrated else None,
                 "fourDegreeRangeHighF": high + FOUR_DEGREE_HALF_WIDTH_F if is_calibrated else None,
                 "uncertainty": "Low" if half_width is not None and half_width <= 2.5 else ("Moderate" if half_width is not None else "Unavailable"),
@@ -694,6 +721,13 @@ def _assemble_payload(target_date: date, forecasts: list[dict[str, Any]], model_
         "forecastInputs": "NCEP NBM + HRRR + GFS forecast guidance",
         "validationTarget": "Official NOAA/NCEI daily TMAX",
         "evaluationContract": "10,279 held-out station-day forecasts across all 20 configured stations; archived 24-hour lead composite",
+        # The accuracy/trend/betDecision figures above all score the model's
+        # raw prediction. `forecasts[].highF` can differ from
+        # `forecasts[].rawModelHighF` when `stabilize_display_high` holds a
+        # small refresh change or an observed high lifts the display value;
+        # no equivalent backtest measures the *displayed* value's own hit
+        # rate or interval coverage. See AUDIT.md item 16.
+        "evaluationBasis": "Accuracy, trend, and betDecision figures are scored against the raw model prediction (rawModelHighF), not the display-stabilized highF shown on the board.",
         "releaseStatus": "Experimental shadow monitoring — not operational guidance",
         "modelVersion": model_version,
         "stabilityPolicy": "Minor refresh changes under 2°F are held; observed highs can update today.",

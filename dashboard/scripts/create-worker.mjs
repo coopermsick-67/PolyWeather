@@ -118,21 +118,57 @@ function directNbmEndpoint(stations) {
   return endpoint;
 }
 
-function directGuidanceForecast(station, targetDate, item) {
+// Fallback guidance is useful weather information, but it is not the
+// calibrated model represented by a packaged dashboard snapshot. Remove all
+// board-level calibrated evidence along with per-station decisions.
+function fallbackSnapshotBase() {
+  return {
+    ...snapshot,
+    accuracy: [],
+    modelEvidence: null,
+    trend: [],
+    betSummary: null,
+  };
+}
+
+// Number(x) coerces null to 0 and undefined/non-numeric strings to NaN. A
+// bare Number.isFinite(Number(x)) check therefore treats a genuine null
+// temperature value (which Open-Meteo can return for a day outside a
+// model's actual coverage) as a valid, finite 0F reading instead of "no
+// data." Reject null/undefined explicitly before coercing.
+function finiteTemperature(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  if (typeof value === 'string' && value.trim() === '') return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function directGuidanceForecast(station, targetDate, item, model = 'ncep_nbm_conus') {
   const daily = item?.daily;
   const index = Array.isArray(daily?.time) ? daily.time.indexOf(targetDate) : -1;
-  const value = Number(daily?.temperature_2m_max?.[index]);
-  if (!Number.isFinite(value)) return null;
+  const value = finiteTemperature(daily?.temperature_2m_max?.[index]);
+  if (value === null) return null;
   const high = Math.round(value);
-  // Never carry stale observations, intervals, or model output from the
-  // packaged snapshot into a live fallback result.
-  const prior = snapshot.forecasts.find((forecast) => forecast.station === station.stationId) ?? {};
+  const isBestMatch = model === 'best_match';
+  const sourceName = isBestMatch
+    ? 'Live Open-Meteo best-match guidance (requested NBM model was unavailable)'
+    : 'Live NCEP NBM via Open-Meteo';
+  const reasonCode = isBestMatch
+    ? 'Requested NCEP NBM guidance was unavailable for this station; unspecified Open-Meteo best-match guidance is shown instead. The calibrated forecast service is unavailable, so residual MOS and observed-high adjustments are deliberately disabled.'
+    : 'Live NCEP NBM daily guidance via Open-Meteo. The calibrated forecast service is unavailable, so residual MOS and observed-high adjustments are deliberately disabled.';
+  // A prior snapshot (packaged reference or a previous live/calibrated
+  // response) is intentionally NOT spread into this object: doing so used to
+  // let unlisted fields -- most importantly betDecision, a real
+  // recommendation computed against a *different* forecast -- leak through
+  // unnoticed onto this uncalibrated fallback result. Every field this
+  // fallback can honestly populate is listed explicitly below instead.
   return {
-    ...prior,
     station: station.stationId,
     city: station.name,
     marketLocation: station.display_name,
     settlementNote: station.display_note,
+    settlementSource: null,
     timezone: station.timezone,
     marketType: 'daily_high',
     targetDate,
@@ -147,6 +183,13 @@ function directGuidanceForecast(station, targetDate, item) {
     modelRange: null,
     uncertainty: 'Unavailable',
     isCalibrated: false,
+    forecastLeadDays: null,
+    evaluatedLeadDays: null,
+    supportedHorizon: false,
+    featureCompletenessPct: null,
+    guidanceComplete: false,
+    requiredGuidanceModels: [],
+    sourceProvenance: null,
     currentObservedTemperatureF: null,
     observedHighSoFarF: null,
     observedLowSoFarF: null,
@@ -156,10 +199,13 @@ function directGuidanceForecast(station, targetDate, item) {
     sourceAgreement: null,
     modelSpreadF: null,
     sourceCount: 1,
-    sourceName: 'Live NCEP NBM via Open-Meteo',
+    sourceName,
     dataQualityStatus: 'DIRECT_GUIDANCE_FALLBACK',
-    reasonCodes: ['Live NCEP NBM daily guidance via Open-Meteo. The calibrated forecast service is unavailable, so residual MOS and observed-high adjustments are deliberately disabled.'],
+    reasonCodes: [reasonCode],
     stabilityReason: 'direct_guidance_fallback',
+    // No calibrated distribution exists for a direct-guidance fallback, so
+    // there is nothing honest to recommend a bet against.
+    betDecision: null,
   };
 }
 
@@ -179,10 +225,13 @@ async function directNbmDashboard(targetDate) {
   // Retry independent station requests, and only then use best_match as a
   // clearly labeled availability fallback. One city must not blank all 20.
   let stations = Array.isArray(payload) ? payload : [payload];
+  // Every station in the initial bulk request was asked for ncep_nbm_conus
+  // specifically; only a per-station repair below may substitute best_match.
+  let stationModels = snapshot.stationRegistry.map(() => 'ncep_nbm_conus');
   const hasRequestedHigh = (item) => {
     const daily = item?.daily;
     const index = Array.isArray(daily?.time) ? daily.time.indexOf(resolvedDate) : -1;
-    return Number.isFinite(Number(daily?.temperature_2m_max?.[index]));
+    return finiteTemperature(daily?.temperature_2m_max?.[index]) !== null;
   };
   if (!payload || stations.length !== snapshot.stationRegistry.length || stations.some((item) => !hasRequestedHigh(item))) {
     const missing = snapshot.stationRegistry.map((station, index) => ({ station, index })).filter(({ index }) => !hasRequestedHigh(stations[index]));
@@ -195,18 +244,29 @@ async function directNbmDashboard(targetDate) {
         const endpoint = directNbmEndpoint([station]);
         endpoint.searchParams.set('models', model);
         const point = await fetchWithTimeout(endpoint, { headers: { Accept: 'application/json' } }, 8_000);
-        return jsonIfOk(point);
+        const item = await jsonIfOk(point);
+        return item ? { item, model } : null;
       };
-        try { return { index, item: await requestFor('ncep_nbm_conus') || await requestFor('best_match') }; } catch { return { index, item: null }; }
+        try {
+          const result = (await requestFor('ncep_nbm_conus')) || (await requestFor('best_match'));
+          return { index, item: result?.item ?? null, model: result?.model ?? null };
+        } catch { return { index, item: null, model: null }; }
       }));
-      for (const { index, item } of repaired) stations[index] = item;
+      for (const { index, item, model } of repaired) {
+        stations[index] = item;
+        // A repaired station that still failed keeps its prior (unused)
+        // label; only a successful repair may relabel it as best_match.
+        if (model) stationModels[index] = model;
+      }
     }
   }
-  const forecasts = snapshot.stationRegistry.map((station, index) => directGuidanceForecast(station, resolvedDate, stations[index])).filter(Boolean);
+  const forecasts = snapshot.stationRegistry
+    .map((station, index) => directGuidanceForecast(station, resolvedDate, stations[index], stationModels[index]))
+    .filter(Boolean);
   if (!forecasts.length) throw new Error('Direct NCEP NBM guidance returned no usable daily highs.');
   const available = new Set(forecasts.map((forecast) => forecast.station));
   return {
-    ...snapshot,
+    ...fallbackSnapshotBase(),
     today,
     targetDate: resolvedDate,
     maxDate: addDays(today, 7),
@@ -214,6 +274,9 @@ async function directNbmDashboard(targetDate) {
     forecasts,
     unavailableStations: snapshot.stationRegistry.filter((station) => !available.has(station.stationId)).map((station) => station.stationId),
     marketForecast: true,
+    // The packaged snapshot can contain an old board-level recommendation
+    // summary. This fallback has no calibrated decisions, so it cannot carry
+    // that summary forward even though individual forecast objects are safe.
     forecastInputs: 'Live NCEP NBM daily-high guidance via Open-Meteo. Calibrated server-side residual MOS is temporarily unavailable.',
     modelStatus: 'DIRECT_GUIDANCE_FALLBACK: live NCEP NBM shown without residual calibration.',
     releaseStatus: 'Fallback guidance refreshes every 15 minutes. It is live, but it is not a substitute for the calibrated 20-station forecast service.',
@@ -250,7 +313,7 @@ async function nwsStationForecast(station, targetDate, today) {
     targetDate === today ? nwsJson(observationUrl).catch(() => null) : Promise.resolve(null),
   ]);
   const period = (forecastPayload.properties?.periods ?? []).find((item) =>
-    item.isDaytime && dateAtStation(item.startTime, station) === targetDate && Number.isFinite(Number(item.temperature))
+    item.isDaytime && dateAtStation(item.startTime, station) === targetDate && finiteTemperature(item.temperature) !== null
   );
   if (!period) return null;
 
@@ -265,18 +328,21 @@ async function nwsStationForecast(station, targetDate, today) {
   const observedTemperatures = observations.map((item) => item.temperatureF);
   const observedHigh = observedTemperatures.length ? Math.max(...observedTemperatures) : null;
   const observedLow = observedTemperatures.length ? Math.min(...observedTemperatures) : null;
-  const nwsHigh = Math.round(Number(period.temperature));
+  const nwsHigh = Math.round(finiteTemperature(period.temperature));
   // A live reported station high is factual and must never be overwritten by
   // a forecast that was issued before that observation arrived.
   const high = Math.max(nwsHigh, observedHigh == null ? -Infinity : Math.round(observedHigh));
-  const prior = snapshot.forecasts.find((forecast) => forecast.station === station.stationId) ?? {};
+  // A prior snapshot is intentionally NOT spread into this object -- see the
+  // matching comment in directGuidanceForecast. Every field this fallback
+  // can honestly populate is listed explicitly below instead.
   return {
-    ...prior,
     station: station.stationId,
     city: station.name,
     marketLocation: station.display_name,
     settlementNote: station.display_note,
+    settlementSource: null,
     timezone: station.timezone,
+    marketType: 'daily_high',
     targetDate,
     highF: high,
     rawModelHighF: nwsHigh,
@@ -289,12 +355,26 @@ async function nwsStationForecast(station, targetDate, today) {
     modelRange: null,
     uncertainty: 'Unavailable',
     isCalibrated: false,
+    forecastLeadDays: null,
+    evaluatedLeadDays: null,
+    supportedHorizon: false,
+    featureCompletenessPct: null,
+    guidanceComplete: false,
+    requiredGuidanceModels: [],
+    sourceProvenance: {
+      provider: 'National Weather Service',
+      fetchedAt: new Date().toISOString(),
+      publishedAt: forecastPayload.properties?.updated ?? null,
+      // NWS publication time is not an underlying numerical-model run ID,
+      // so it cannot establish the age of the source guidance.
+      sourceRunAgeVerified: false,
+    },
     currentObservedTemperatureF: latest ? Math.round(latest.temperatureF * 10) / 10 : null,
     observedHighSoFarF: observedHigh == null ? null : Math.round(observedHigh),
     observedLowSoFarF: observedLow == null ? null : Math.round(observedLow),
     intradayObservations: observations,
     lastObservationAt: latest?.time ?? null,
-    dataFreshness: 1,
+    dataFreshness: null,
     sourceAgreement: null,
     modelSpreadF: null,
     sourceName: 'NWS official daily forecast',
@@ -302,6 +382,9 @@ async function nwsStationForecast(station, targetDate, today) {
     dataQualityStatus: 'LIVE_NWS_FORECAST',
     reasonCodes: ['NWS daily forecast: ' + (period.shortForecast || ('high near ' + nwsHigh + '°F')) + '. ' + (latest ? 'Station observations are live.' : 'No station observation has been reported for this selected day yet.')],
     stabilityReason: observedHigh != null && high > nwsHigh ? 'observed_high' : 'nws_live_forecast',
+    // No calibrated distribution exists for a live NWS fallback, so there is
+    // nothing honest to recommend a bet against.
+    betDecision: null,
   };
 }
 
@@ -322,7 +405,7 @@ async function nwsLiveDashboard(targetDate) {
   if (!forecasts.length) throw new Error('NWS did not return daily forecasts for any configured station.');
   const available = new Set(forecasts.map((forecast) => forecast.station));
   return {
-    ...snapshot,
+    ...fallbackSnapshotBase(),
     today,
     targetDate: resolvedDate,
     maxDate: addDays(today, 7),
@@ -343,7 +426,7 @@ function packagedSnapshotDashboard(targetDate) {
   const today = localDate(now, 'America/New_York');
   const resolvedDate = targetDateForRequest(targetDate, today, earliestStationLocalToday(now, snapshot.stationRegistry));
   return {
-    ...snapshot,
+    ...fallbackSnapshotBase(),
     today,
     targetDate: resolvedDate,
     maxDate: addDays(today, 7),

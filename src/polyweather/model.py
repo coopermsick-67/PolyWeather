@@ -95,12 +95,28 @@ NON_FEATURE_COLUMNS = {
 def _validate_training_contract(frame: pd.DataFrame) -> None:
     """Reject mixed/unsupported horizons instead of learning an undefined task."""
     if "forecast_lead_days" in frame:
-        leads = set(pd.to_numeric(frame["forecast_lead_days"], errors="coerce").dropna().astype(int))
-        if leads and leads != {SUPPORTED_FORECAST_LEAD_DAYS}:
+        leads = pd.to_numeric(frame["forecast_lead_days"], errors="coerce")
+        if not leads.eq(SUPPORTED_FORECAST_LEAD_DAYS).all() or frame["forecast_lead_days"].map(lambda v: isinstance(v, (bool, np.bool_))).any():
             raise ValueError(
                 "Residual MOS is evaluated only for a 1-day forecast lead; "
-                f"received lead_days={sorted(leads)}. Train separate artifacts per horizon."
+                "invalid or missing lead found. Train separate artifacts per horizon."
             )
+    if pd.to_datetime(frame["target_date"], errors="coerce").isna().any():
+        raise ValueError("Training rows require valid target dates.")
+    if frame.assign(target_date=pd.to_datetime(frame["target_date"])).duplicated(["station", "target_date"]).any():
+        raise ValueError("Duplicate station-date training rows are not independent evidence.")
+
+
+def usable_training_rows(frame: pd.DataFrame) -> pd.DataFrame:
+    """Apply input-quality gates even when retraining from an older Parquet."""
+    from .data import MODEL_SOURCES, has_complete_core_guidance
+
+    usable = frame.copy()
+    values = usable[[TARGET_COLUMN, BASELINE_COLUMN]].apply(pd.to_numeric, errors="coerce")
+    mask = np.isfinite(values).all(axis=1)
+    if any(f"{source}__availability" in usable for source in MODEL_SOURCES):
+        mask &= pd.Series([has_complete_core_guidance(row) for row in usable.to_dict("records")], index=usable.index)
+    return usable.loc[mask].copy()
 
 
 def feature_completeness(model: Any, frame: pd.DataFrame) -> np.ndarray:
@@ -344,7 +360,7 @@ class ResidualForecaster:
         random_state: int = 20260813,
     ) -> "ResidualForecaster":
         _validate_training_contract(train)
-        usable = train.dropna(subset=[TARGET_COLUMN, BASELINE_COLUMN]).copy()
+        usable = usable_training_rows(train)
         usable["target_date"] = pd.to_datetime(usable["target_date"])
         usable = usable.sort_values(["target_date", "station"], kind="stable")
         if len(usable) < 50:

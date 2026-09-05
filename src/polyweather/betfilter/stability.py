@@ -13,6 +13,14 @@ from datetime import datetime, timedelta, timezone
 
 import numpy as np
 
+# Below this many hours of elapsed span between the oldest and newest
+# snapshot, stability credit is scaled down proportionally: two identical
+# refreshes one second apart is zero real evidence that a forecast has
+# "settled," even though the raw volatility computation alone would score it
+# a perfect 1.0. Refreshing more often must never be a way to manufacture
+# stability credit that only genuine elapsed time can earn.
+MIN_HOURS_FOR_FULL_STABILITY_CREDIT = 3.0
+
 
 @dataclass(frozen=True)
 class ForecastSnapshot:
@@ -37,6 +45,7 @@ class StabilityAnalysis:
     trend_consistency: float
     stability_score: float
     hours_observed: float
+    recent_movement_6h_f: float | None = None
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -44,12 +53,12 @@ def _as_utc(value: datetime) -> datetime:
 
 
 def _change_over(snapshots: list[ForecastSnapshot], now: datetime, hours: float) -> float | None:
-    """Signed movement from the oldest snapshot inside the window to the newest."""
+    """Compare against a real snapshot at/before the requested lookback."""
     cutoff = now - timedelta(hours=hours)
-    window = [item for item in snapshots if _as_utc(item.captured_at) >= cutoff]
-    if len(window) < 2:
+    before = [item for item in snapshots if _as_utc(item.captured_at) <= cutoff]
+    if not before or cutoff - _as_utc(before[-1].captured_at) > timedelta(hours=1):
         return None
-    return float(window[-1].predicted_high_f - window[0].predicted_high_f)
+    return float(snapshots[-1].predicted_high_f - before[-1].predicted_high_f)
 
 
 def analyze(
@@ -71,6 +80,8 @@ def analyze(
     reference = _as_utc(now) if now else (
         _as_utc(ordered[-1].captured_at) if ordered else datetime.now(timezone.utc)
     )
+    ordered = [item for item in ordered
+               if reference - timedelta(hours=24) <= _as_utc(item.captured_at) <= reference]
     if len(ordered) < 2:
         return StabilityAnalysis(
             snapshot_count=len(ordered), change_3h_f=None, change_6h_f=None,
@@ -80,7 +91,10 @@ def analyze(
         )
     values = np.asarray([item.predicted_high_f for item in ordered], dtype=float)
     steps = np.diff(values)
-    volatility = float(np.mean(np.abs(steps)))
+    hours = (_as_utc(ordered[-1].captured_at) - _as_utc(ordered[0].captured_at)).total_seconds() / 3600.0
+    # Total movement per elapsed hour is invariant to inserting unchanged
+    # refreshes. Mean movement per refresh can be diluted arbitrarily.
+    volatility = float(np.sum(np.abs(steps)) / max(hours, 1e-6))
     recent = [
         item for item in ordered
         if _as_utc(item.captured_at) >= reference - timedelta(hours=12)
@@ -103,6 +117,12 @@ def analyze(
         # Crossing a bucket boundary is categorically worse than drifting
         # inside one: it means the recommendation itself already changed.
         score *= 0.5 ** flips
+    # A near-zero elapsed span cannot demonstrate settledness no matter how
+    # many snapshots were taken inside it -- refreshing twice a second would
+    # otherwise earn the same credit as genuinely holding steady for hours.
+    score *= max(0.0, min(1.0, hours / MIN_HOURS_FOR_FULL_STABILITY_CREDIT))
+    recent_six = [item.predicted_high_f for item in ordered
+                  if _as_utc(item.captured_at) >= reference - timedelta(hours=6)]
     return StabilityAnalysis(
         snapshot_count=len(ordered),
         change_3h_f=_change_over(ordered, reference, 3),
@@ -115,4 +135,5 @@ def analyze(
         trend_consistency=float(consistency),
         stability_score=float(max(0.0, min(1.0, score))),
         hours_observed=float(hours),
+        recent_movement_6h_f=float(max(recent_six) - min(recent_six)) if len(recent_six) >= 2 else None,
     )

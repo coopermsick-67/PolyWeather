@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
 
-from .data import MODEL_SOURCES, fetch_live_forecast_features, fetch_ncei_daily_tmax, has_complete_core_guidance
+from .data import MODEL_SOURCES, SourceError, fetch_live_forecast_features, fetch_ncei_daily_tmax, has_complete_core_guidance
 from .metrics import forecast_metrics, interval_metrics
 from .model import (
     MIN_PREDICTION_FEATURE_COMPLETENESS,
@@ -35,7 +37,6 @@ def create_shadow_records(
     evaluated residual MOS (NBM + HRRR + GFS).  Missing guidance is not
     imputed into a supposedly prospective performance record.
     """
-    issued_at = datetime.now(timezone.utc).isoformat()
     records: list[dict] = []
     for station in stations:
         local_today = pd.Timestamp.now(tz=station.timezone).date()
@@ -62,9 +63,11 @@ def create_shadow_records(
                 f"finite model features (minimum {MIN_PREDICTION_FEATURE_COMPLETENESS:.0%})."
             )
         output = model.predict(pd.DataFrame([features])).iloc[0].to_dict()
+        issued_at = datetime.now(timezone.utc).isoformat()
         records.append(
             {
                 "station": station.icao,
+                "status": "forecast",
                 "ghcn_id": station.ghcn_id,
                 "target_date": target_date.isoformat(),
                 "target_definition": "NCEI daily-summaries TMAX (official daily maximum)",
@@ -114,6 +117,50 @@ def create_shadow_records(
     return records
 
 
+def create_shadow_run(model, stations: Iterable[Station], target_date: date, **kwargs) -> list[dict]:
+    """Capture every requested opportunity, including source/quality outages."""
+    records = []
+    for station in stations:
+        try:
+            records.extend(create_shadow_records(model, [station], target_date, **kwargs))
+        except (SourceError, ValueError) as exc:
+            records.append({
+                "station": station.icao, "ghcn_id": station.ghcn_id,
+                "target_date": target_date.isoformat(),
+                "issue_time_utc": datetime.now(timezone.utc).isoformat(),
+                "issue_time_contract": "latest live multi-model forecast at request time",
+                "status": "unavailable", "reason": str(exc),
+                "forecast_f": None, "interval_lower_f": None, "interval_upper_f": None,
+                "model_artifact_sha256": kwargs.get("model_artifact_sha256"),
+            })
+    return records
+
+
+@contextmanager
+def _log_lock(target: Path):
+    """Serialize the duplicate check and append across processes on Windows/Unix."""
+    with target.with_suffix(target.suffix + ".lock").open("a+b") as lock:
+        lock.seek(0, os.SEEK_END)
+        if lock.tell() == 0:
+            lock.write(b"\0")
+            lock.flush()
+        lock.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def append_jsonl(records: Iterable[dict], path: str | Path) -> Path:
     """Append one auditable forecast per station/date/issue contract.
 
@@ -123,6 +170,15 @@ def append_jsonl(records: Iterable[dict], path: str | Path) -> Path:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     materialized = list(records)
+    # Serialization must finish before writing the first record; malformed
+    # batches must not leave a partially logged run.
+    serialized = "".join(json.dumps(record, sort_keys=True, default=str) + "\n" for record in materialized)
+    with _log_lock(target):
+        _append_locked(materialized, serialized, target)
+    return target
+
+
+def _append_locked(materialized: list[dict], serialized: str, target: Path) -> None:
     existing_keys: set[tuple[str, str, str]] = set()
     if target.exists():
         for line in target.read_text(encoding="utf-8").splitlines():
@@ -141,9 +197,9 @@ def append_jsonl(records: Iterable[dict], path: str | Path) -> Path:
             )
         new_keys.add(key)
     with target.open("a", encoding="utf-8") as handle:
-        for record in materialized:
-            handle.write(json.dumps(record, sort_keys=True, default=str) + "\n")
-    return target
+        handle.write(serialized)
+        handle.flush()
+        os.fsync(handle.fileno())
 
 
 def verify_shadow_log(path: str | Path) -> tuple[pd.DataFrame, dict[str, float]]:
@@ -161,14 +217,21 @@ def verify_shadow_log(path: str | Path) -> tuple[pd.DataFrame, dict[str, float]]
         except json.JSONDecodeError:
             malformed_lines.append(line_number)
     if malformed_lines:
-        logging.getLogger(__name__).error(
-            "Skipped %d malformed line(s) in shadow log %s: %s", len(malformed_lines), source, malformed_lines
-        )
+        raise ValueError(f"Shadow log contains malformed lines: {malformed_lines}; repair from the original record before scoring.")
     if not records:
         raise ValueError("Shadow log contains no forecast records.")
     forecasts = pd.DataFrame(records)
+    if forecasts.duplicated(["station", "target_date", "issue_time_contract"]).any():
+        raise ValueError("Duplicate prospective snapshots cannot be scored.")
+    from .stations import STATIONS
+    for record in records:
+        station = STATIONS[str(record["station"])]
+        issued = pd.Timestamp(record.get("issue_time_utc"))
+        if pd.isna(issued) or issued.tzinfo is None or issued.tz_convert(station.timezone).date() >= date.fromisoformat(record["target_date"]):
+            raise ValueError("Shadow forecast must be timestamped before its station-local target day.")
     forecasts["target_date"] = pd.to_datetime(forecasts["target_date"]).dt.date
-    mature = forecasts.loc[forecasts["target_date"] < date.today()].copy()
+    mature = forecasts.loc[[target < datetime.now(STATIONS[station].tzinfo).date()
+                            for station, target in zip(forecasts.station, forecasts.target_date, strict=True)]].copy()
     if mature.empty:
         return mature, {"n": 0}
     # The caller's records include official IDs, so reconstruct lightweight
@@ -177,9 +240,12 @@ def verify_shadow_log(path: str | Path) -> tuple[pd.DataFrame, dict[str, float]]
 
     requested = [STATIONS[station] for station in sorted(mature["station"].unique())]
     labels = fetch_ncei_daily_tmax(requested, mature["target_date"].min(), mature["target_date"].max())
-    verified = mature.merge(labels[["station", "target_date", "tmax_f"]], on=["station", "target_date"], how="inner")
+    verified = mature.merge(labels[["station", "target_date", "tmax_f"]], on=["station", "target_date"], how="inner", validate="many_to_one")
     metrics = forecast_metrics(verified, "tmax_f", "forecast_f")
     lower = "interval_lower_f" if "interval_lower_f" in verified else "p10_f"
     upper = "interval_upper_f" if "interval_upper_f" in verified else "p90_f"
     metrics.update(interval_metrics(verified, actual="tmax_f", lower=lower, upper=upper))
+    metrics.update({"mature_opportunities": len(mature), "resolved_opportunities": len(verified),
+                    "pending_labels": len(mature) - len(verified),
+                    "forecast_coverage": float(metrics["n"] / len(verified)) if len(verified) else 0.0})
     return verified, metrics

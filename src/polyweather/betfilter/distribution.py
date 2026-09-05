@@ -125,7 +125,7 @@ class TemperatureDistribution:
             return raw
         # Renormalize over the surviving support rather than reporting mass
         # that today's observations have already ruled out.
-        floor_mass = self._raw_cdf(floor)
+        floor_mass = self._raw_cdf(np.nextafter(floor, -np.inf))
         if floor_mass >= 1.0 - 1e-12:
             return 1.0
         return (raw - floor_mass) / (1.0 - floor_mass)
@@ -142,7 +142,10 @@ class TemperatureDistribution:
         return s1 / total + (2.0 * s2 / total) * (_phi((value - self.expected_high_f) / s2) - 0.5)
 
     def probability_between(self, lower: float, upper: float) -> float:
-        return max(0.0, self.cdf(upper) - self.cdf(lower))
+        """Mass in [lower, upper), matching the settlement result scorer."""
+        if upper < lower:
+            raise ValueError("Probability window is inverted.")
+        return max(0.0, self.cdf(np.nextafter(upper, -np.inf)) - self.cdf(np.nextafter(lower, -np.inf)))
 
     def bucket_probability(
         self, lower_f: int, upper_f: int, rounding: str = "nearest"
@@ -167,8 +170,21 @@ class TemperatureDistribution:
         )
 
     def quantile(self, probability: float) -> float:
+        if not 0.0 < probability < 1.0:
+            raise ValueError("Quantile probability must be strictly between 0 and 1.")
+        floor = self.observed_high_floor_f
         if self.residuals is not None and self.residuals.size:
-            return float(self.expected_high_f + np.quantile(self.residuals, probability))
+            support = self.residuals + self.expected_high_f
+            if floor is not None:
+                support = support[support >= floor]
+                if not support.size:
+                    return float(floor)
+            return float(np.quantile(support, probability))
+        if floor is not None:
+            floor_mass = self._raw_cdf(floor)
+            if floor_mass >= 1.0 - 1e-12:
+                return float(floor)
+            probability = min(np.nextafter(1.0, 0.0), floor_mass + probability * (1.0 - floor_mass))
         s1, s2 = self.sigma_lower_f, self.sigma_upper_f
         total = s1 + s2
         split = s1 / total if total > 0 else 0.5
@@ -259,13 +275,13 @@ def candidate_buckets(
     94-95 board and a 93-94 board are different grids and scoring the wrong
     one produces a confident answer to a question nobody asked.
     """
-    if bucket_width_f < 1:
+    if bucket_width_f < 1 or int(bucket_width_f) != bucket_width_f:
         raise ValueError("Bucket width must be at least one degree.")
     center = int(round(distribution.expected_high_f))
     anchor = center if anchor_f is None else anchor_f
     # Align the grid so `anchor` is the lower edge of one of the buckets.
     offset = (center - anchor) % bucket_width_f
-    start = center - offset - span_f
+    start = center - offset - math.ceil(span_f / bucket_width_f) * bucket_width_f
     buckets = [
         distribution.bucket_probability(lower, lower + bucket_width_f - 1, rounding)
         for lower in range(start, center + span_f + 1, bucket_width_f)

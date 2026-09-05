@@ -54,20 +54,40 @@ class SourceError(RuntimeError):
     """Raised when an upstream weather source cannot provide required data."""
 
 
+# A "complete" hourly profile that only actually covered a few hours of the
+# day can still produce a finite Tmax figure (max-of-what's-there), but that
+# is not a reliable whole-day maximum -- one archived training row passed
+# every existing gate with only 16.67% (4 of 24 hours) of NBM coverage. See
+# AUDIT.md item 13.
+MIN_HOURLY_PROFILE_AVAILABILITY = 0.90
+
+
+def finite_number(value: object) -> float | None:
+    """Parse numeric source values without treating booleans as temperatures."""
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
 def has_complete_core_guidance(features: dict[str, object]) -> bool:
     """Return whether every model required by the residual MOS supplied Tmax.
 
     The fitted residual model was evaluated with NBM, HRRR, and GFS together.
     Scikit-learn can impute a missing source, but doing that live would silently
     change the deployed forecast contract.  Callers must therefore use the
-    residual correction only when this small, non-imputed core is present.
+    residual correction only when this small, non-imputed core is present
+    *and* each source's own hourly profile actually covered most of the day.
     """
     for model in MODEL_SOURCES:
-        value = features.get(f"{model}__tmax_f")
-        try:
-            if not np.isfinite(float(value)):
-                return False
-        except (TypeError, ValueError):
+        value = finite_number(features.get(f"{model}__tmax_f"))
+        availability = finite_number(features.get(f"{model}__availability"))
+        if value is None or availability is None:
+            return False
+        if not MIN_HOURLY_PROFILE_AVAILABILITY <= availability <= 1.0:
             return False
     return True
 
@@ -162,8 +182,10 @@ def fetch_ncei_daily_tmax(stations: Iterable[Station], start: date, end: date) -
     rows: list[dict] = []
     for record in records:
         station_id = record.get("STATION")
-        high = pd.to_numeric(record.get("TMAX"), errors="coerce")
-        if station_id not in by_ghcn or pd.isna(high):
+        high = finite_number(record.get("TMAX"))
+        attributes = str(record.get("TMAX_ATTRIBUTES") or "").split(",")
+        quality_flag = attributes[1].strip() if len(attributes) > 1 else ""
+        if station_id not in by_ghcn or high is None or quality_flag:
             continue
         rows.append(
             {
@@ -197,6 +219,8 @@ def _summarize_hourly_forecast(
     local_time = pd.to_datetime(hourly.get("time", []), errors="coerce")
     if len(local_time) == 0:
         return pd.DataFrame()
+    if local_time.isna().any():
+        raise SourceError("Hourly forecast contains invalid timestamps.")
     frame = pd.DataFrame({"local_time": local_time})
     frame["target_date"] = frame["local_time"].dt.date
     for model in models:
@@ -207,10 +231,20 @@ def _summarize_hourly_forecast(
                 # Provider may not have a requested variable/model in older windows.
                 frame[f"{model}__{variable}"] = np.nan
             else:
-                frame[f"{model}__{variable}"] = pd.to_numeric(values, errors="coerce")
+                if len(values) != len(frame):
+                    raise SourceError(f"Hourly forecast length mismatch for {column}.")
+                frame[f"{model}__{variable}"] = [finite_number(value) for value in values]
 
     result_rows: list[dict] = []
     for target_date, day in frame.groupby("target_date", sort=True):
+        # Count against the entire local day, not merely returned rows. The
+        # local clock has 23/25 hours on DST transitions. Repeated timestamps
+        # cannot manufacture coverage; a repeated fall-back hour is allowed
+        # only as many times as it actually occurs on that day.
+        start = pd.Timestamp(target_date, tz=station.timezone)
+        end = pd.Timestamp(target_date + timedelta(days=1), tz=station.timezone)
+        expected = pd.date_range(start, end, freq="h", inclusive="left").tz_localize(None)
+        expected_counts = pd.Series(expected).value_counts()
         row: dict[str, object] = {
             "station": station.icao,
             "target_date": target_date,
@@ -242,7 +276,10 @@ def _summarize_hourly_forecast(
                     row[f"{prefix}_mean"] = float(values.mean()) if values.notna().any() else np.nan
                     row[f"{prefix}_max"] = float(values.max()) if values.notna().any() else np.nan
                     row[f"{prefix}_min"] = float(values.min()) if values.notna().any() else np.nan
-            row[f"{model}__availability"] = float(temperature.notna().mean())
+            present_counts = day.loc[temperature.notna(), "local_time"].value_counts()
+            covered = sum(min(int(present_counts.get(hour, 0)), int(count))
+                          for hour, count in expected_counts.items())
+            row[f"{model}__availability"] = float(covered / len(expected))
         result_rows.append(row)
     return pd.DataFrame(result_rows)
 
@@ -433,6 +470,23 @@ def build_training_table(
     )
     table = labels.merge(forecasts, on=["station", "target_date"], how="inner", validate="one_to_one")
     table = add_derived_forecast_features(_add_calendar_features(table))
+    # A four-hour NBM window can still produce a finite Tmax figure while
+    # most of the day is missing (see AUDIT.md item 13: 60 rows in the
+    # existing v4 table pass every other gate with as little as 16.67%
+    # hourly coverage). Reject those rows here rather than only reporting
+    # them in the separate quality report, which never actually excluded
+    # them from training.
+    availability_columns = [f"{model}__availability" for model in MODEL_SOURCES if f"{model}__availability" in table]
+    if availability_columns:
+        sufficient = pd.concat(
+            [pd.to_numeric(table[column], errors="coerce") >= MIN_HOURLY_PROFILE_AVAILABILITY for column in availability_columns],
+            axis=1,
+        ).all(axis=1)
+        dropped = int((~sufficient).sum())
+        if dropped:
+            print(f"Dropping {dropped} row(s) with a core guidance source under "
+                  f"{MIN_HOURLY_PROFILE_AVAILABILITY:.0%} hourly-profile availability.", flush=True)
+        table = table.loc[sufficient].reset_index(drop=True)
     # The archived NBM hourly profile is the unmodified physical/NWP baseline.
     table["nbm_baseline_f"] = table["ncep_nbm_conus__tmax_f"]
     table["issue_time_contract"] = f"fixed {lead_days * 24}h archived lead"

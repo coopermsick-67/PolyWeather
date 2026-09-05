@@ -61,6 +61,8 @@ class DataQuality:
     settlement_station_verified: bool
     data_age_minutes: float | None
     forecast_horizon_hours: float | None = None
+    source_run_age_verified: bool = False
+    probability_calibration_verified: bool = False
 
 
 @dataclass(frozen=True)
@@ -232,20 +234,29 @@ def _run_hard_gates(
         log.add("UNSUPPORTED_HORIZON", "critical",
                 "The model is evaluated only at its supported forecast lead; this request is outside it.")
         return "DATA_INSUFFICIENT"
-    if quality.feature_completeness < gates.minimum_feature_completeness:
+    if not np.isfinite(quality.feature_completeness) or not gates.minimum_feature_completeness <= quality.feature_completeness <= 1:
         log.add("LOW_FEATURE_COMPLETENESS", "critical",
                 f"Only {quality.feature_completeness:.0%} of required model inputs are present.",
                 quality.feature_completeness, gates.minimum_feature_completeness)
         return "DATA_INSUFFICIENT"
-    if quality.source_count < gates.minimum_data_sources:
+    if not np.isfinite(quality.source_count) or min(quality.source_count, evidence.ensemble.distinct_value_count) < gates.minimum_data_sources:
         log.add("INSUFFICIENT_DATA_SOURCES", "critical",
                 f"Only {quality.source_count} guidance source(s) reported; agreement cannot be assessed.",
                 quality.source_count, gates.minimum_data_sources)
         return "DATA_INSUFFICIENT"
-    if quality.data_age_minutes is not None and quality.data_age_minutes > gates.maximum_data_age_minutes:
+    if (not quality.source_run_age_verified or quality.data_age_minutes is None
+            or not np.isfinite(quality.data_age_minutes) or quality.data_age_minutes < 0):
+        log.add("SOURCE_RUN_AGE_UNVERIFIED", "critical",
+                "Source-run age is unknown or invalid; retrieval time does not establish freshness.")
+        return "DATA_INSUFFICIENT"
+    if quality.data_age_minutes > gates.maximum_data_age_minutes:
         log.add("STALE_DATA", "critical",
                 f"Supporting data is {quality.data_age_minutes:.0f} minutes old.",
                 quality.data_age_minutes, gates.maximum_data_age_minutes)
+        return "DATA_INSUFFICIENT"
+    if not quality.probability_calibration_verified:
+        log.add("PROBABILITY_CALIBRATION_UNVERIFIED", "critical",
+                "Bucket probabilities have no matching independent validation for this distribution and selection policy.")
         return "DATA_INSUFFICIENT"
     if bucket is None:
         log.add("MISSING_CRITICAL_DATA", "critical", "No market bucket could be evaluated.")
@@ -277,10 +288,24 @@ def _run_hard_gates(
                 evidence.ensemble.spread_f, gates.maximum_ensemble_spread_f)
         return "PASS"
     change_6h = evidence.stability.change_6h_f
-    if change_6h is not None and abs(change_6h) > gates.maximum_forecast_revision_6h_f:
+    recent_movement = evidence.stability.recent_movement_6h_f
+    if change_6h is None and recent_movement is None:
+        # No revision trail means the movement gate has nothing to measure.
+        # Folding that into ``or 0.0`` would score an unmeasured forecast as
+        # perfectly steady and let it satisfy the gate outright -- the exact
+        # inversion `stability.analyze` refuses to make when it returns 0.0
+        # rather than a neutral score for a single snapshot. Every
+        # station-day's first refresh takes this path, so treating it as
+        # calm silently waves through the least-evidenced forecasts of all.
+        log.add("FORECAST_STABILITY_UNKNOWN", "critical",
+                "No forecast revision history is available for this station-day, so 6-hour "
+                "movement cannot be measured; an unmeasured forecast is not a steady one.")
+        return "DATA_INSUFFICIENT"
+    movement = max(abs(change_6h or 0.0), recent_movement or 0.0)
+    if movement > gates.maximum_forecast_revision_6h_f:
         log.add("FORECAST_UNSTABLE", "critical",
-                f"Forecast moved {change_6h:+.1f}F in the last 6 hours.",
-                abs(change_6h), gates.maximum_forecast_revision_6h_f)
+                f"Observed forecast movement reached {movement:.1f}F within the last 6 hours.",
+                movement, gates.maximum_forecast_revision_6h_f)
         return "PASS"
     if evidence.stability.bucket_flips_12h > gates.maximum_bucket_flips_12h:
         log.add("BUCKET_FLIP_RISK", "critical",
@@ -301,9 +326,19 @@ def _run_hard_gates(
 
 
 def _log_supporting_evidence(evidence: BetEvidence, bucket: BucketProbability, log: ReasonLog) -> None:
-    if evidence.ensemble.spread_f <= 1.0 and evidence.ensemble.source_count >= 3:
+    if evidence.ensemble.duplicate_groups:
+        # A "guidance source" that is byte-identical to another one is not
+        # corroborating evidence -- see AUDIT.md item 1. Surface it instead
+        # of letting it silently inflate agreement/source-count credit.
+        described = "; ".join(" and ".join(group) for group in evidence.ensemble.duplicate_groups)
+        log.add("DUPLICATE_GUIDANCE_SOURCES", "medium",
+                f"Guidance sources reported byte-identical values ({described}); "
+                "they are not counted as independent agreement.",
+                evidence.ensemble.distinct_value_count)
+    if evidence.ensemble.spread_f <= 1.0 and evidence.ensemble.distinct_value_count >= 3:
         log.add("HIGH_ENSEMBLE_AGREEMENT", "positive",
-                f"{evidence.ensemble.source_count} guidance sources agree within {evidence.ensemble.spread_f:.1f}F.",
+                f"{evidence.ensemble.distinct_value_count} independently-valued guidance sources agree "
+                f"within {evidence.ensemble.spread_f:.1f}F.",
                 evidence.ensemble.spread_f)
     if evidence.stability.stability_score >= 0.75 and evidence.stability.snapshot_count >= 3:
         log.add("STABLE_FORECAST", "positive",
@@ -355,21 +390,31 @@ def decide(evidence: BetEvidence, config: BetFilterConfig | None = None) -> BetD
         rounding=config.settlement_rounding,
         anchor_f=evidence.market_bucket[0] if evidence.market_bucket else None,
     )
-    if evidence.market_bucket is not None:
-        lower, upper = evidence.market_bucket
-        selected = evidence.distribution.bucket_probability(lower, upper, config.settlement_rounding)
-    else:
-        selected = buckets[0] if buckets else None
     # Every downstream gate is a probability threshold, so the correction has
     # to land before the gates run -- not as a display-only adjustment.
-    if config.apply_probability_calibration and evidence.calibrator.knots_x:
+    if config.apply_probability_calibration and evidence.calibrator.knots_x and buckets:
+        calibrated_buckets = [_calibrated(bucket, evidence.calibrator) for bucket in buckets]
+        calibrated_mass = sum(bucket.probability for bucket in calibrated_buckets)
+        # Independently recalibrating each mutually-exclusive bucket can push
+        # their total above 1 -- an impossible outcome for a coherent
+        # probability partition (a reproducible Miami example reached
+        # 115.27% total mass). Rescale down only as much as needed to restore
+        # that invariant. A legitimate downward correction (mass already
+        # <= 1) is left untouched, so the calibrator's entire purpose --
+        # lowering overconfidence -- is not undone by scaling it back up.
+        scale = 1.0 / calibrated_mass if calibrated_mass > 1.0 else 1.0
         buckets = sorted(
-            (_calibrated(bucket, evidence.calibrator) for bucket in buckets),
+            (dataclasses_replace(bucket, probability=bucket.probability * scale) for bucket in calibrated_buckets),
             key=lambda bucket: bucket.probability,
             reverse=True,
         )
-        if selected is not None:
-            selected = _calibrated(selected, evidence.calibrator)
+    # Recommend whichever bucket this distribution actually favors, not
+    # necessarily the one containing the rounded point forecast: minimizing
+    # absolute temperature error (what the model is trained to do) and
+    # maximizing bucket-hit probability (what a 2F market pays for) are
+    # different objectives, and an asymmetric distribution can favor a
+    # neighboring bucket even when the point estimate sits inside another.
+    selected = buckets[0] if buckets else None
     gap = probability_gap(buckets)
     entropy = normalized_entropy(buckets)
 
