@@ -45,6 +45,11 @@ from .reliability import StationReliability, assess as assess_reliability, shrin
 from .results import financial_result, net_profit, resolve, settled_in_bucket
 from .stability import ForecastSnapshot, StabilityAnalysis
 from .stability import analyze as analyze_stability
+from .threshold import (
+    ThresholdContract,
+    contract_for_target,
+    win_probability as threshold_win_probability,
+)
 
 __all__ = [
     "DEFAULT_CONFIG",
@@ -66,12 +71,14 @@ __all__ = [
     "StabilityAnalysis",
     "StationReliability",
     "TemperatureDistribution",
+    "ThresholdContract",
     "TierThresholds",
     "analyze_ensemble",
     "analyze_observation",
     "analyze_stability",
     "assess_reliability",
     "candidate_buckets",
+    "contract_for_target",
     "decide",
     "financial_result",
     "from_calibrated_interval",
@@ -84,5 +91,6 @@ __all__ = [
     "settlement_window",
     "shrink",
     "summarize",
+    "threshold_win_probability",
     "wilson_interval",
 ]
