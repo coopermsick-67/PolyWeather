@@ -1,25 +1,17 @@
-"""Threshold (over/under) contracts, where a high win rate is actually reachable.
+"""Research probability estimates for hypothetical integer threshold lines.
 
-A 2F bracket asks the forecast to be almost exact, and held-out measurement
-says that lands about 38% of the time -- no amount of selectivity in
-``reports/accuracy_improvement_2026-09-05/selective_win_rate.json`` lifted it
-past 46%. A threshold contract asks a strictly easier question: not "which
-bucket" but "which side of this line". Pushing the line away from the point
-forecast buys win rate directly, and on frozen held-out data a 3F margin
-settled our way 91.8% (>=) and 93.2% (<=) of the time.
-
-The thing that buys is win *rate*, and nothing else. A contract that settles
-our way 92% of the time is priced near 92 cents by anyone competent, so a
-high win rate here is not an edge and not profit -- it is the market's own
-estimate, restated. Every function below reports probability only; none of
-them claims value, and callers must not present these numbers as an edge
-without pricing the other side of the trade.
+A line solved from a distribution is not evidence that a corresponding market
+exists or is executable. Neither this helper nor a high historical hit rate
+validates the input distribution, its probabilities, or financial returns.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Literal
+
+import math
+import numpy as np
 
 from .distribution import TemperatureDistribution
 
@@ -69,8 +61,13 @@ def win_probability(
     """Probability this threshold contract settles in our favour."""
     if side not in ("gte", "lte"):
         raise ValueError(f"Unknown threshold side: {side!r}. Use 'gte' or 'lte'.")
+    if isinstance(threshold_f, (bool, np.bool_)) or not math.isfinite(threshold_f) or int(threshold_f) != threshold_f:
+        raise ValueError("Threshold must be a finite integer temperature.")
     cutoff = _settlement_cutoff(threshold_f, side, rounding)
-    below = distribution.cdf(cutoff)
+    # Nearest/floor LTE loses at the upper half-open cutoff; exact LTE
+    # includes equality. GTE always includes equality at its lower cutoff.
+    below = distribution.cdf(cutoff if side == "lte" and rounding == "exact"
+                             else np.nextafter(cutoff, -np.inf))
     # ``cdf`` already renormalises over an observed-high floor, so a line the
     # day has physically ruled out reports 0 or 1 rather than a stale prior.
     return float(max(0.0, min(1.0, below if side == "lte" else 1.0 - below)))
@@ -101,8 +98,15 @@ def contract_for_target(
     # stepping while the achieved probability still falls short -- one step is
     # enough for a continuous distribution, but an empirical one is a step
     # function and can need more.
-    candidate = int(exact) if side == "gte" else int(exact) + 1
-    while candidate > int(exact) - 40:
+    if not math.isfinite(exact):
+        raise ValueError("Cannot solve a threshold from a non-finite quantile.")
+    center = math.floor(exact)
+    # Search from the most demanding line toward the easier side. This is
+    # bounded for BOTH directions and also handles atoms/negative temperatures.
+    # Starting only on the easy side of a quantile can skip the nearest valid
+    # integer line under nearest-degree settlement.
+    candidates = range(center + 40, center - 41, -1) if side == "gte" else range(center - 40, center + 41)
+    for candidate in candidates:
         achieved = win_probability(distribution, candidate, side, rounding)
         if achieved >= target_probability:
             return ThresholdContract(
@@ -114,7 +118,6 @@ def contract_for_target(
                     else candidate - distribution.expected_high_f
                 ),
             )
-        candidate += -1 if side == "gte" else 1
     raise ValueError(
         f"No threshold within 40F reached {target_probability:.0%} for side {side!r}; "
         "the distribution is too wide or an observed-high floor has ruled the side out."

@@ -1,98 +1,65 @@
-# Can WeatherPicks hit an 85% win rate?
+# Accuracy experiments and completed correctness fixes
 
-**Measured answer: yes on one contract type, no on the other two.**
+**85% all-city within-2°F accuracy and an 85% operational betting win rate have not been achieved.** The software fixes and experiments are complete; source collection, deployment, market integration, and prospective validation remain outstanding.
 
-Everything below was frozen on the validation window (2026-05-05 → 2026-07-03,
-1,200 rows) and then measured exactly once on the held-out test window
-(2026-07-04 → 2026-09-01, 1,199 rows). Thresholds were never tuned on test.
-Confidence intervals are weekly-block bootstraps, because forecasts made on
-the same day across cities share one weather pattern and an i.i.d. interval
-would be far too narrow.
+This replaces the earlier interpretation of the threshold experiment. A historical hit rate on a hypothetical line does not establish that the line is offered by a market, that its estimated probability is calibrated, or that trading it is profitable. An unsuccessful candidate search also does not establish a theoretical skill ceiling.
 
-Reproduce with:
+## Reproduced results
 
-```bash
-python scripts/evaluate_selective_win_rate.py
+The original rolling experiment remains 67.886% within 2°F across 10,279 rows. The new comparison trained/calibrated before its validation and test periods, excluding 60 inadequate training profiles. Validation covers May 5–July 3, 2026 (1,200 rows); test covers July 4–September 1 (1,199 usable rows). These are previously inspected historical data with an issuance convention that differs from live requests. The chronological test is not fresh prospective evidence.
+
+| Evaluation on the 1,199-row test | Rate | Descriptive 95% seven-date-block interval |
+|---|---:|---:|
+| All-city point forecast within 2°F | 68.31% | 66.25–70.37% |
+| Default even-anchored two-degree bucket | 38.03% | 34.81–41.17% |
+| Hypothetical lower threshold | 91.83% | 90.42–93.08% |
+| Hypothetical upper threshold | 93.16% | 91.83–94.65% |
+| Verified operational/financial win rate | Unavailable | Unavailable |
+
+The two challenger regressors scored 61.42% and 61.83% within 2°F on validation, versus 65.58% for the incumbent approach. They were rejected before testing. No production artifact was replaced or deployed. The incumbent refit reached 1.715°F test MAE. This split differs from the original rolling evaluation; the difference in rates is not evidence of an operational improvement.
+
+The station-only selection policy chose Las Vegas and Phoenix using validation alone. It reached 70.83% within 2°F on 120 test rows, at 10.01% selection coverage, with a 60.00–80.83% block interval. It failed the 85% target.
+
+## Corrected threshold and selection experiment
+
+The confidence regressor now fits on the first 30 validation dates and selects its cutoff on the last 30 dates. Previously it selected cutoffs on the same rows used to fit confidence. No tested cutoff reaches 85% at 5% minimum coverage: best observed selection-window rates are 76.32% within 2°F and 48.32% exact-bucket hits. These describe this particular search, not the best possible model or selector.
+
+The threshold experiment now uses explicit integer lines matching the probability helper's nearest-degree convention:
+
+```
+settled = floor(actual + 0.5)
+lower_line = floor(prediction - margin + 0.5)
+upper_line = ceil(prediction + margin - 0.5)
+lower_hit = settled >= lower_line
+upper_hit = settled <= upper_line
 ```
 
-## Result
+It selects the smallest margin meeting 85% on both sides in validation and scores only that margin on test. The corrected margin is 2.5°F before outward rounding. With whole-degree labels this produces the same test hit rates as the previous unrounded ±3°F comparison. All lines are hypothetical; 100% evaluation coverage is not 100% executable-market coverage. This rerun corrects the prior analysis on already inspected test data and is not a newly untouched test.
 
-| Contract | Test win rate | 95% CI | Coverage | ≥85%? |
-|---|---|---|---|---|
-| 2°F bracket (exact bucket) | 38.0% | 34.8–41.2% | 100% | **No** |
-| Point forecast within 2°F | 68.3% | 66.3–70.4% | 100% | **No** |
-| Threshold `≥ forecast − 3°F` | **91.8%** | 90.4–93.1% | 100% | **Yes** |
-| Threshold `≤ forecast + 3°F` | **93.2%** | 91.8–94.7% | 100% | **Yes** |
+The threshold helper now handles empirical atoms at settlement boundaries, validates integer lines, returns the most demanding line satisfying the requested probability, and bounds its search in both directions. Its output is still only an estimate conditional on the supplied distribution. It does not generate live recommendations or replace the decision gates.
 
-## Why selectivity could not rescue the first two
+## Correctness fixes and validation
 
-The obvious lever is to bet only when the forecast looks confident. It was
-tried properly — a confidence model fit on validation over ensemble spread,
-inter-model disagreement, NBM position, and lead time — and it is not enough:
+Across this work and the preserved preceding fixes:
 
-- **Within 2°F**: the best achievable validation win rate at ≥5% coverage was
-  **75.7%**. No cutoff reached 85%, so nothing was carried to test.
-- **Exact 2°F bucket**: best achievable was **45.5%**. Not close.
+- Missing, boolean, nonnumeric, and nonfinite source values cannot masquerade as valid temperatures or coverage. Missing availability fails closed. Expected full local-day hours, including DST, determine coverage; truncated and duplicated timestamps cannot inflate it. Malformed hourly arrays fail explicitly.
+- NCEI labels with quality flags or nonfinite temperatures are excluded. Retraining from older tables applies profile checks. Missing/fractional/boolean horizons and duplicate training station-dates are rejected.
+- Empirical buckets use the same half-open settlement windows as the result scorer. Observed-floor conditioning retains mass exactly at the floor and applies to quantiles. Bucket grids remain aligned for arbitrary widths.
+- Unknown/invalid run age and unverified probability calibration block recommendations. Retrieval time is not source-run age. Unknown revision history blocks recommendations; refresh padding cannot dilute movement per hour, and future snapshots cannot provide evidence.
+- Display smoothing no longer translates the calibrated interval. The displayed point still uses a continuity policy whose accuracy has not been independently replayed.
+- Prospective logging serializes duplicate checks and appends across processes, timestamps predictions after source retrieval, and records source failures per station. Verification rejects nonprospective timestamps, duplicate or corrupted records, uses station-local maturity, and reports outages and unresolved labels.
+- Existing browser/Worker fallbacks continue clearing stale recommendation evidence and rejecting invalid temperatures.
 
-This is a skill ceiling, not a tuning failure. Held-out MAE is 1.71°F, so the
-predictive distribution has σ ≈ 2.3°F. Landing inside a *specific* 2°F window
-85% of the time would require σ ≈ 0.5°F — roughly four times the skill any
-operational day-ahead guidance has. Raising a threshold cannot manufacture it.
+Verified using the workspace Python 3.11 environment: **206 Python tests passed**, including 73 regressions added after the preceding 133-test state. **24 JavaScript tests passed**, `npm run build` passed, Worker syntax passed, and `git diff --check` passed. Tests verify behavior, not predictive accuracy. Global Python 3.14 crashed inside pandas during the experiment; use `.venv/Scripts/python.exe` for reproducibility.
 
-A raw decile sweep on ensemble spread says the same thing from the other
-direction: even the most-agreeing 10% of city-days came in at 71.9% within 2°F
-on test, and 40.0% on the bucket.
+## Artifacts and reproduction
 
-## Why threshold contracts do reach it
+```
+.venv/Scripts/python.exe scripts/evaluate_accuracy_candidates.py
+.venv/Scripts/python.exe scripts/evaluate_selective_win_rate.py --output reports/accuracy_improvement_2026-09-05/corrected
+.venv/Scripts/python.exe -m pytest
+```
 
-A bracket asks the forecast to be nearly exact. A threshold contract only asks
-it to land on the right side of a line, and pushing that line away from the
-point forecast buys win rate directly:
+The candidate run saves `protocol.json`, `frozen_selection.json`, `summary.json`, and both prediction Parquets in this directory. The corrected analysis is in `corrected/selective_win_rate.json`, including script and prediction-file hashes. Previous JSON is retained for comparison. Generated JSON/Parquet artifacts are locally available but ignored by the repository's existing artifact rules; reproduce them with the commands above.
 
-| Margin | val ≥ | val ≤ | test ≥ | test ≤ |
-|---|---|---|---|---|
-| 1°F | 66.2% | 72.7% | 72.0% | 66.9% |
-| 2°F | 79.6% | 86.0% | 84.9% | 83.4% |
-| **3°F** | **88.0%** | **93.6%** | **91.8%** | **93.2%** |
-| 4°F | 92.6% | 96.6% | 95.2% | 97.1% |
-| 5°F | 95.8% | 98.6% | 97.2% | 99.0% |
-
-3°F is the smallest margin clearing 85% on **both** sides in validation, and it
-held up on test with room to spare. 2°F is borderline and should not be relied
-on: it failed the ≥ side in validation (79.6%).
-
-## The caveat that matters more than the number
-
-**A 92% win rate here is not a 92% edge, and it is not profit.**
-
-Anyone competent prices a contract that settles 92% of the time at roughly 92
-cents. Winning 92% of the time at those odds is break-even before fees and
-losing after them. The measurement above establishes that the *forecast* is
-well enough calibrated to know which side of a 3°F line the high will fall
-on — it says nothing about whether the market is offering that at a price
-worth taking. Turning this into profit requires the other half of the
-analysis: contract pricing, which is not modelled anywhere in this repository.
-
-Two further limits on the evidence itself:
-
-- **Retrospective, not prospective.** This archive was inspected during
-  development and the issuance times do not match live operation. It is
-  research evidence, not a betting track record.
-- **No live ledger exists.** `verified_operational_win_rate` is still `null`.
-  Nothing here has been confirmed against money at risk.
-
-## What was changed in code
-
-`src/polyweather/betfilter/threshold.py` implements threshold contracts
-against the existing calibrated distribution: `win_probability` for a given
-line, and `contract_for_target` to solve for the nearest line meeting a
-target confidence. It applies the same half-degree settlement rounding the
-bracket path already gets right (a "≥95F" contract is won by a true high of
-94.5F), and it collapses correctly when today's observed high has already
-settled one side. Solved margins for 85–95% confidence land at 2.5–3.5°F,
-which independently agrees with the empirical table above.
-
-The model itself was **not** changed and **not** promoted. The GFS-ablation
-and alternative-regressor candidates both scored worse than the incumbent on
-validation (61.4% and 61.8% within 2°F, against 65.6%), so the incumbent
-stands.
+Remaining prerequisites for a credible 85% operational claim: independently identified forecast runs; matching historical/live cutoffs; verified provider contracts and executable lines/prices; appropriately calibrated conditional distributions; successful serving of the intended model; and an immutable, resolved prospective record with adequate dates, selection coverage, and uncertainty. No future hit rate, universal skill ceiling, or financial edge is inferred from the historical threshold experiment.

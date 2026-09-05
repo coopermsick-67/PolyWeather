@@ -101,10 +101,14 @@ def _report(frame: pd.DataFrame, column: str, total: int) -> dict:
 
 
 def selective_confidence(validation: pd.DataFrame, test: pd.DataFrame, outcome: str) -> dict:
-    """Fit a confidence model on validation, freeze a cutoff, apply to test."""
+    """Fit confidence on early validation; select a cutoff on later dates."""
+    dates = sorted(validation.target_date.unique())
+    split_date = dates[len(dates) // 2]
+    confidence_fit = validation[validation.target_date < split_date]
+    validation = validation[validation.target_date >= split_date].copy()
     model = Pipeline([("scale", StandardScaler()),
                       ("model", LogisticRegression(C=0.5, max_iter=2000, random_state=SEED))])
-    model.fit(validation[CONFIDENCE_FEATURES].astype(float), validation[outcome].astype(int))
+    model.fit(confidence_fit[CONFIDENCE_FEATURES].astype(float), confidence_fit[outcome].astype(int))
     validation = validation.assign(confidence=model.predict_proba(
         validation[CONFIDENCE_FEATURES].astype(float))[:, 1])
     test = test.assign(confidence=model.predict_proba(
@@ -125,7 +129,9 @@ def selective_confidence(validation: pd.DataFrame, test: pd.DataFrame, outcome: 
     result = {
         "outcome": outcome,
         "frozen_cutoff": frozen,
-        "validation_best_achievable": max(eligible, key=lambda row: row["win_rate"], default=None),
+        "confidence_fit_rows": len(confidence_fit),
+        "cutoff_selection_rows": len(validation),
+        "validation_best_observed": max(eligible, key=lambda row: row["win_rate"], default=None),
         "validation_curve": curve,
     }
     if frozen is None:
@@ -138,6 +144,18 @@ def selective_confidence(validation: pd.DataFrame, test: pd.DataFrame, outcome: 
     return result
 
 
+def hypothetical_threshold_hits(frame: pd.DataFrame, margin: float) -> tuple[np.ndarray, np.ndarray]:
+    """Integer lines rounded outward, using the helper's nearest-degree rule.
+
+    Lines are hypothetical; no executable market inventory is supplied.
+    """
+    settled = np.floor(frame["tmax_f"].to_numpy(float) + .5)
+    predicted = frame[PREDICTION].to_numpy(float)
+    gte_line = np.floor(predicted - margin + .5)
+    lte_line = np.ceil(predicted + margin - .5)
+    return settled >= gte_line, settled <= lte_line
+
+
 def threshold_contracts(validation: pd.DataFrame, test: pd.DataFrame) -> dict:
     """Win rate for THRESHOLD_GTE/LTE contracts set a margin off the forecast.
 
@@ -147,16 +165,14 @@ def threshold_contracts(validation: pd.DataFrame, test: pd.DataFrame) -> dict:
     charges for it, which this analysis does not model.
     """
     output = {
-        "note": "Win rate only. No market pricing here, so this is not an edge or a profit claim.",
+        "note": "Hypothetical integer lines, rounded outward. Historical hit frequency only; market availability, probability calibration, and profitability are unverified.",
         "margins": [], "frozen_margin_f": None, "test": None,
     }
     for margin in np.arange(0.0, 12.5, 0.5):
         row = {"margin_f": float(margin)}
-        for name, frame in (("validation", validation), ("test", test)):
-            actual = frame["tmax_f"].to_numpy(float)
-            predicted = frame[PREDICTION].to_numpy(float)
-            row[f"{name}_gte_win_rate"] = float(np.mean(actual >= predicted - margin))
-            row[f"{name}_lte_win_rate"] = float(np.mean(actual <= predicted + margin))
+        gte, lte = hypothetical_threshold_hits(validation, margin)
+        row["validation_gte_win_rate"] = float(np.mean(gte))
+        row["validation_lte_win_rate"] = float(np.mean(lte))
         output["margins"].append(row)
 
     # Freeze the smallest margin clearing the target on BOTH sides in validation.
@@ -169,8 +185,7 @@ def threshold_contracts(validation: pd.DataFrame, test: pd.DataFrame) -> dict:
 
     margin = output["frozen_margin_f"]
     frame = test.copy()
-    frame["gte_win"] = frame["tmax_f"] >= frame[PREDICTION] - margin
-    frame["lte_win"] = frame["tmax_f"] <= frame[PREDICTION] + margin
+    frame["gte_win"], frame["lte_win"] = hypothetical_threshold_hits(frame, margin)
     output["test"] = {"margin_f": margin,
                       "gte": _report(frame, "gte_win", len(frame)),
                       "lte": _report(frame, "lte_win", len(frame))}
@@ -181,10 +196,19 @@ def run(source: Path, output: Path) -> None:
     output.mkdir(parents=True, exist_ok=True)
     validation = _outcomes(pd.read_parquet(source / "validation_predictions.parquet"))
     test = _outcomes(pd.read_parquet(source / "test_predictions.parquet"))
+    for frame in (validation, test):
+        if frame.duplicated(["station", "target_date"]).any():
+            raise ValueError("Evaluation requires unique station-date rows.")
+    if validation.target_date.max() >= test.target_date.min():
+        raise ValueError("Validation must strictly precede the chronological test.")
 
     result = {
         "protocol": {
             "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "prediction_hashes": {name: hashlib.sha256((source / name).read_bytes()).hexdigest()
+                                  for name in ("validation_predictions.parquet", "test_predictions.parquet")},
+            "confidence_protocol": "Fit on first 30 validation dates, select cutoff on last 30; score frozen policy on test",
+            "threshold_protocol": "Select integer-line margin on validation only; test only that one margin",
             "validation_rows": int(len(validation)),
             "test_rows": int(len(test)),
             "validation_window": [str(validation.target_date.min().date()),
@@ -193,7 +217,7 @@ def run(source: Path, output: Path) -> None:
                             str(test.target_date.max().date())],
             "target": TARGET,
             "minimum_coverage": MIN_COVERAGE,
-            "rule": ("Thresholds frozen on validation, measured once on test; "
+            "rule": ("Thresholds frozen on validation; this is a corrected rerun on previously inspected test data; "
                      "the 95% CI lower bound must clear the target"),
             "evidence_status": ("RETROSPECTIVE_RESEARCH; the archive was inspected during "
                                 "development and issuance times do not match live operation; "
@@ -227,10 +251,9 @@ def run(source: Path, output: Path) -> None:
                       if k != "margins"}, indent=2), flush=True)
     for row in result["threshold_contracts"]["margins"]:
         if row["margin_f"] % 1 == 0:
-            print("margin %4.1fF  val gte %.3f lte %.3f | test gte %.3f lte %.3f" % (
+            print("margin %4.1fF  val gte %.3f lte %.3f" % (
                 row["margin_f"], row["validation_gte_win_rate"],
-                row["validation_lte_win_rate"], row["test_gte_win_rate"],
-                row["test_lte_win_rate"]), flush=True)
+                row["validation_lte_win_rate"]), flush=True)
 
 
 if __name__ == "__main__":

@@ -766,3 +766,70 @@ def test_a_measurable_revision_trail_still_passes_the_stability_gate():
     decision = decide(_evidence(snapshots=_snapshots([94.4, 94.5, 94.5]), observed_high=92.0))
     assert decision.tier != "DATA_INSUFFICIENT"
     assert not any(reason["code"] == "FORECAST_STABILITY_UNKNOWN" for reason in decision.reasons)
+
+
+@pytest.mark.parametrize("age", [None, float("nan"), float("inf"), -1])
+def test_unknown_or_invalid_run_age_cannot_satisfy_freshness(age):
+    decision = decide(_evidence(data_age=age))
+    assert decision.tier == "DATA_INSUFFICIENT"
+    assert decision.reasons[0]["code"] == "SOURCE_RUN_AGE_UNVERIFIED"
+
+
+@pytest.mark.parametrize("field, reason", [
+    ("source_run_age_verified", "SOURCE_RUN_AGE_UNVERIFIED"),
+    ("probability_calibration_verified", "PROBABILITY_CALIBRATION_UNVERIFIED"),
+])
+def test_unverified_evidence_blocks_an_otherwise_strong_recommendation(field, reason):
+    from dataclasses import replace
+    evidence = _evidence()
+    decision = decide(replace(evidence, data_quality=replace(evidence.data_quality, **{field: False})))
+    assert decision.tier == "DATA_INSUFFICIENT"
+    assert decision.reasons[0]["code"] == reason
+
+
+def test_nonfinite_completeness_cannot_satisfy_quality_gate():
+    assert decide(_evidence(completeness=float("nan"))).tier == "DATA_INSUFFICIENT"
+
+
+def test_empirical_bucket_mass_uses_same_half_open_window_as_settlement():
+    distribution = from_residual_history(0.0, np.tile([93.5, 95.5], 60))
+    assert distribution.bucket_probability(94, 95).probability == .5
+    assert distribution.bucket_probability(96, 97).probability == .5
+    assert distribution.bucket_probability(92, 93).probability == 0
+
+
+def test_floor_keeps_empirical_mass_at_the_observed_high_and_conditions_quantiles():
+    distribution = from_residual_history(0, np.tile([91.5, 93.5, 95.5], 40), observed_high_floor_f=93.5)
+    assert distribution.bucket_probability(94, 95).probability == pytest.approx(.5)
+    assert distribution.quantile(.1) >= 93.5
+    assert distribution.cdf(93.5) == pytest.approx(.5)
+
+
+def test_zero_tail_floor_retains_a_point_mass_in_its_bucket():
+    distribution = from_residual_history(0, np.zeros(120), observed_high_floor_f=93.5)
+    assert distribution.bucket_probability(94, 95).probability == 1
+    assert distribution.quantile(.5) == 93.5
+
+
+def test_bucket_grid_stays_anchored_when_span_is_not_divisible_by_width():
+    distribution = from_calibrated_interval(81, 78, 84, .8)
+    buckets = candidate_buckets(distribution, bucket_width_f=3, span_f=8, anchor_f=80)
+    assert all((item.lower_f - 80) % 3 == 0 for item in buckets)
+
+
+def test_refresh_padding_does_not_dilute_forecast_volatility():
+    sparse = [ForecastSnapshot(NOW - timedelta(hours=6), 94), ForecastSnapshot(NOW, 96)]
+    padded = [sparse[0], *[ForecastSnapshot(NOW - timedelta(minutes=m), 94) for m in range(359, 0, -1)], sparse[1]]
+    assert analyze_stability(sparse, NOW).stability_score == pytest.approx(analyze_stability(padded, NOW).stability_score)
+
+
+def test_future_snapshot_cannot_create_stability_evidence():
+    snapshots = [ForecastSnapshot(NOW, 94), ForecastSnapshot(NOW + timedelta(hours=6), 94)]
+    result = analyze_stability(snapshots, NOW)
+    assert result.snapshot_count == 1
+    assert result.stability_score == 0
+
+
+def test_exact_upper_settlement_edge_is_already_impossible():
+    alignment = analyze_observation(True, 94.5, observed_high_so_far_f=95.5, bucket_upper_f=95.5)
+    assert alignment.bucket_already_impossible

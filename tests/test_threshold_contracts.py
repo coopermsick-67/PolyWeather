@@ -97,3 +97,29 @@ def test_an_unknown_side_is_rejected_rather_than_guessed():
         contract_for_target(_distribution(), 0.9, "under")  # type: ignore[arg-type]
     with pytest.raises(ValueError):
         contract_for_target(_distribution(), 1.0, "gte")
+@pytest.mark.parametrize("rounding", ["nearest", "truncate", "exact"])
+@pytest.mark.parametrize("side", ["gte", "lte"])
+@pytest.mark.parametrize("expected", [-5.2, 0.0, 94.5])
+def test_target_solver_returns_most_demanding_valid_integer_line(rounding, side, expected):
+    distribution = from_calibrated_interval(expected, expected - 2.2, expected + 3.0, .8)
+    result = contract_for_target(distribution, .85, side, rounding)
+    assert result.win_probability >= .85
+    tougher_line = result.threshold_f + (1 if side == "gte" else -1)
+    assert win_probability(distribution, tougher_line, side, rounding) < .85
+
+
+def test_empirical_thresholds_include_lower_and_exclude_upper_cutoff_atoms():
+    import numpy as np
+    from polyweather.betfilter import from_residual_history
+    distribution = from_residual_history(0.0, np.tile([93.5, 95.5], 60))
+    assert win_probability(distribution, 94, "gte") == 1.0
+    assert win_probability(distribution, 95, "lte") == .5
+    assert win_probability(distribution, 96, "gte") == .5
+    assert win_probability(distribution, 94, "lte", "exact") == .5
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), True, 94.2])
+def test_threshold_rejects_invalid_integer_line(value):
+    distribution = from_calibrated_interval(94.5, 93.0, 96.0, .8)
+    with pytest.raises(ValueError, match="finite integer"):
+        win_probability(distribution, value, "gte")
